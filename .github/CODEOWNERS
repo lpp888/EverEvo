@@ -1,0 +1,3 @@
+# CODEOWNERS — @wwkkyy0325 is the required reviewer for protected branches.
+# Used by branch protection (require code-owner review) on main and develop-wky.
+* @wwkkyy0325

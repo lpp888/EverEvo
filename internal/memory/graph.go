@@ -1,0 +1,546 @@
+package memory
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// GraphEdge is a relation between two entities, with both endpoints' names.
+type GraphEdge struct {
+	ID         string `json:"id"`
+	SrcID      string `json:"srcId"`
+	DstID      string `json:"dstId"`
+	Type       string `json:"type"`
+	SrcName    string `json:"srcName"`
+	DstName    string `json:"dstName"`
+	ValidFrom  int64  `json:"validFrom"`
+	ValidTo    int64  `json:"validTo"` // 0 = currently valid
+	RecordedAt int64  `json:"recordedAt"`
+	CrossTags  string `json:"crossTags"` // JSON array of library IDs (P7 cross-library)
+	Weight     int    `json:"weight"`    // consolidated count of identical relations
+}
+
+// GraphNode is an entity row for the UI viewer.
+type GraphNode struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Name      string `json:"name"` // display form (name_raw, falling back to name)
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// normalizeName is the disambiguation key: case-insensitive, trimmed. Good enough
+// for single-user memory (LLM coreference resolution is a P3 follow-up).
+func normalizeName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func placeholders(n int) string {
+	return strings.TrimRight(strings.Repeat("?,", n), ",")
+}
+
+// predicateSynonyms maps variant predicates to a canonical form so semantically
+// identical relations merge into one edge type — and bi-temporal close keys on
+// the canonical form. Extend as patterns emerge from real usage.
+var predicateSynonyms = map[string]string{
+	"用":       "使用",
+	"采用":     "使用",
+	"用着":     "使用",
+	"使用着":   "使用",
+	"喜爱":     "喜欢",
+	"偏好":     "喜欢",
+	"爱用":     "喜欢",
+	"工作于":   "就职于",
+	"任职于":   "就职于",
+	"在...工作": "就职于",
+	"处于":     "位于",
+}
+
+// normalizePredicate canonicalizes a relation predicate (trim + synonym lookup).
+func normalizePredicate(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return p
+	}
+	if canon, ok := predicateSynonyms[p]; ok {
+		return canon
+	}
+	return p
+}
+
+// UpsertNode returns the id of the entity with the given name, creating it if
+// absent. Disambiguation is by normalized name (ToLower+TrimSpace), so "Go",
+// "go ", "GO" all merge into one node. The embed callback vectorizes the name so
+// the node can be found as a graph seed; if it fails the node is still stored
+// (graph degrades to SQLite-only — no seed-by-similarity for that entity).
+func (s *Store) UpsertNode(nodeType, name, workspaceID string, embed func(string) ([]float32, error)) (string, error) {
+	norm := normalizeName(name)
+	if norm == "" {
+		return "", fmt.Errorf("empty entity name")
+	}
+
+	var id string
+	err := s.db.QueryRow(`SELECT id FROM kg_nodes WHERE name = ?`, norm).Scan(&id)
+	if err == nil {
+		// Existing entity — refresh surface form / type only if they were blank.
+		_, _ = s.db.Exec(`UPDATE kg_nodes
+			SET name_raw = COALESCE(NULLIF(name_raw, ''), ?),
+			    type = COALESCE(NULLIF(type, ''), ?)
+			WHERE id = ?`, name, nodeType, id)
+		return id, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", err
+	}
+
+	id = "n_" + uuid.NewString()
+	now := time.Now().UnixMilli()
+	embeddingID := ""
+	if embed != nil {
+		if vec, eErr := embed(name); eErr == nil && len(vec) > 0 {
+			if aErr := s.AddEntity(id, name, nodeType, vec); aErr == nil {
+				embeddingID = id
+			}
+		}
+	}
+	if workspaceID == "" {
+		workspaceID = "default"
+	}
+	_, err = s.db.Exec(`INSERT INTO kg_nodes(id, type, name, name_raw, props, embedding_id, workspace_id, created_at)
+		VALUES(?, ?, ?, ?, '{}', ?, ?, ?)`, id, nodeType, norm, name, embeddingID, workspaceID, now)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// AddEdge records a relation. When replaces is true, the new fact supersedes the
+// currently-valid edge(s) of the same subject + relation type (e.g. "使用 Go" →
+// "使用 Rust" closes "使用 Go", keeping it queryable as history). When false, the
+// new edge coexists (e.g. "也喜欢 Python" alongside an existing like). The new
+// edge is inserted with valid_from = recorded_at = now. crossTags is a JSON array
+// of library IDs the edge belongs to (P7 cross-library).
+func (s *Store) AddEdge(srcID, dstID, relType, props, sessionID, crossTags string, replaces bool) error {
+	if props == "" {
+		props = "{}"
+	}
+	now := time.Now().UnixMilli()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if replaces {
+		if _, err := tx.Exec(`UPDATE kg_edges SET valid_to = ?
+			WHERE src_id = ? AND type = ? AND valid_to IS NULL`, now, srcID, relType); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	} else {
+		// Dedup: bump weight on identical valid edge instead of inserting duplicate.
+		var existingID string
+		if err := tx.QueryRow(`SELECT id FROM kg_edges
+			WHERE src_id=? AND dst_id=? AND type=? AND valid_to IS NULL
+			LIMIT 1`, srcID, dstID, relType).Scan(&existingID); err == nil && existingID != "" {
+			if _, err := tx.Exec(`UPDATE kg_edges SET weight = weight + 1, recorded_at = ?
+				WHERE id = ?`, now, existingID); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			return tx.Commit()
+		}
+	}
+	if crossTags == "" {
+		crossTags = "[]"
+	}
+	// Auto-detect cross-domain: if src and dst are in different workspaces, tag it.
+	var srcWS, dstWS string
+	if row := s.db.QueryRow(`SELECT workspace_id FROM kg_nodes WHERE id=?`, srcID); row.Scan(&srcWS) == nil {
+		if row2 := s.db.QueryRow(`SELECT workspace_id FROM kg_nodes WHERE id=?`, dstID); row2.Scan(&dstWS) == nil {
+			if srcWS != "" && dstWS != "" && srcWS != dstWS {
+				var tags []string
+				json.Unmarshal([]byte(crossTags), &tags)
+				tags = append(tags, "cross-domain")
+				if b, err := json.Marshal(tags); err == nil {
+					crossTags = string(b)
+				}
+			}
+		}
+	}
+	id := "e_" + uuid.NewString()
+	if _, err := tx.Exec(`INSERT INTO kg_edges(id, src_id, dst_id, type, props, valid_from, recorded_at, session_id, cross_tags, weight)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`, id, srcID, dstID, relType, props, now, now, sessionID, crossTags); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// QueryGraph expands from the seed nodes up to `hops` away along currently-valid
+// edges (bidirectional), returning the edges among the reachable sub-graph. This
+// is the graph half of LightRAG-style hybrid retrieval.
+func (s *Store) QueryGraph(seedIDs []string, hops int) ([]GraphEdge, error) {
+	if len(seedIDs) == 0 || hops <= 0 {
+		return nil, nil
+	}
+	q := `
+WITH RECURSIVE reach(id, depth) AS (
+	SELECT id, 0 FROM kg_nodes WHERE id IN (` + placeholders(len(seedIDs)) + `)
+	UNION
+	SELECT e.dst_id, r.depth + 1 FROM reach r
+		JOIN kg_edges e ON e.src_id = r.id
+		WHERE e.valid_to IS NULL AND r.depth < ?
+	UNION
+	SELECT e.src_id, r.depth + 1 FROM reach r
+		JOIN kg_edges e ON e.dst_id = r.id
+		WHERE e.valid_to IS NULL AND r.depth < ?
+)
+SELECT e.id, e.src_id, e.dst_id, e.type, e.valid_from, COALESCE(e.valid_to, 0), e.recorded_at, e.cross_tags, e.weight,
+       sn.name_raw, dn.name_raw
+FROM kg_edges e
+JOIN (SELECT DISTINCT id FROM reach) rs ON rs.id = e.src_id
+JOIN (SELECT DISTINCT id FROM reach) rd ON rd.id = e.dst_id
+JOIN kg_nodes sn ON sn.id = e.src_id
+JOIN kg_nodes dn ON dn.id = e.dst_id
+WHERE e.valid_to IS NULL`
+	args := make([]any, 0, len(seedIDs)+2)
+	for _, id := range seedIDs {
+		args = append(args, id)
+	}
+	args = append(args, hops, hops)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GraphEdge
+	for rows.Next() {
+		var ge GraphEdge
+		if err := rows.Scan(&ge.ID, &ge.SrcID, &ge.DstID, &ge.Type, &ge.ValidFrom, &ge.ValidTo, &ge.RecordedAt, &ge.CrossTags, &ge.Weight, &ge.SrcName, &ge.DstName); err != nil {
+			return nil, err
+		}
+		out = append(out, ge)
+	}
+	return out, rows.Err()
+}
+
+// ListNodes returns all graph nodes (newest first), for the UI viewer.
+func (s *Store) ListNodes() ([]GraphNode, error) { return s.ListNodesByLibrary("") }
+
+// ListNodesByLibrary returns KG nodes filtered by workspace_id. Empty libraryID = all.
+func (s *Store) ListNodesByLibrary(libraryID string) ([]GraphNode, error) {
+	var rows *sql.Rows
+	var err error
+	if libraryID == "" {
+		rows, err = s.db.Query(`SELECT id, type, COALESCE(name_raw, name), created_at FROM kg_nodes ORDER BY created_at DESC`)
+	} else {
+		rows, err = s.db.Query(`SELECT id, type, COALESCE(name_raw, name), created_at FROM kg_nodes WHERE (workspace_id=? OR workspace_id='default') ORDER BY created_at DESC`, libraryID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GraphNode
+	for rows.Next() {
+		var n GraphNode
+		if err := rows.Scan(&n.ID, &n.Type, &n.Name, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// ListAllEdges returns currently-valid edges with endpoint names (newest recorded first).
+func (s *Store) ListAllEdges() ([]GraphEdge, error) { return s.ListAllEdgesByLibrary("") }
+
+// ListAllEdgesByLibrary returns currently-valid edges, optionally filtered by library.
+func (s *Store) ListAllEdgesByLibrary(libraryID string) ([]GraphEdge, error) {
+	var rows *sql.Rows
+	var err error
+	query := `SELECT e.id, e.src_id, e.dst_id, e.type, e.valid_from, COALESCE(e.valid_to, 0), e.recorded_at, e.cross_tags, e.weight,
+		COALESCE(sn.name_raw, sn.name), COALESCE(dn.name_raw, dn.name)
+		FROM kg_edges e
+		JOIN kg_nodes sn ON sn.id = e.src_id
+		JOIN kg_nodes dn ON dn.id = e.dst_id
+		WHERE e.valid_to IS NULL`
+	if libraryID != "" {
+		query += ` AND (sn.workspace_id IN (?,'default') OR dn.workspace_id IN (?,'default') OR e.cross_tags LIKE ?)`
+		rows, err = s.db.Query(query+" ORDER BY e.recorded_at DESC", libraryID, libraryID, "%"+libraryID+"%")
+	} else {
+		rows, err = s.db.Query(query + " ORDER BY e.recorded_at DESC")
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GraphEdge
+	for rows.Next() {
+		var ge GraphEdge
+		if err := rows.Scan(&ge.ID, &ge.SrcID, &ge.DstID, &ge.Type, &ge.ValidFrom, &ge.ValidTo, &ge.RecordedAt, &ge.CrossTags, &ge.Weight, &ge.SrcName, &ge.DstName); err != nil {
+			return nil, err
+		}
+		out = append(out, ge)
+	}
+	return out, rows.Err()
+}
+
+// ListAllEdgesIncludeHistory is like ListAllEdges but also returns closed edges
+// (valid_to set), so the UI can show how beliefs changed over time.
+func (s *Store) ListAllEdgesIncludeHistory() ([]GraphEdge, error) { return s.ListAllEdgesIncludeHistoryByLibrary("") }
+
+func (s *Store) ListAllEdgesIncludeHistoryByLibrary(libraryID string) ([]GraphEdge, error) {
+	query := `SELECT e.id, e.src_id, e.dst_id, e.type, e.valid_from, COALESCE(e.valid_to, 0), e.recorded_at, e.cross_tags, e.weight,
+		COALESCE(sn.name_raw, sn.name), COALESCE(dn.name_raw, dn.name)
+		FROM kg_edges e
+		JOIN kg_nodes sn ON sn.id = e.src_id
+		JOIN kg_nodes dn ON dn.id = e.dst_id`
+	var rows *sql.Rows
+	var err error
+	if libraryID != "" {
+		query += ` WHERE (sn.workspace_id IN (?,'default') OR dn.workspace_id IN (?,'default') OR e.cross_tags LIKE ?)`
+		rows, err = s.db.Query(query+" ORDER BY e.recorded_at DESC", libraryID, libraryID, "%"+libraryID+"%")
+	} else {
+		rows, err = s.db.Query(query + " ORDER BY e.recorded_at DESC")
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GraphEdge
+	for rows.Next() {
+		var ge GraphEdge
+		if err := rows.Scan(&ge.ID, &ge.SrcID, &ge.DstID, &ge.Type, &ge.ValidFrom, &ge.ValidTo, &ge.RecordedAt, &ge.CrossTags, &ge.Weight, &ge.SrcName, &ge.DstName); err != nil {
+			return nil, err
+		}
+		out = append(out, ge)
+	}
+	return out, rows.Err()
+}
+
+// DeleteNode removes a node and cascades its edges. The entity's chromem doc is
+// left in place (harmless orphan — EntitySearch may still return the id, but
+// QueryGraph joins kg_nodes and won't find the deleted node, so it yields nothing).
+func (s *Store) DeleteNode(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kg_edges WHERE src_id = ? OR dst_id = ?`, id, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kg_nodes WHERE id = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteEdge removes a single edge.
+func (s *Store) DeleteEdge(id string) error {
+	_, err := s.db.Exec(`DELETE FROM kg_edges WHERE id = ?`, id)
+	return err
+}
+
+// NodeCount returns the total entity count (for status/UI).
+func (s *Store) NodeCount() int { return s.NodeCountByLibrary("") }
+func (s *Store) NodeCountByLibrary(libraryID string) int {
+	var n int
+	if libraryID == "" {
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM kg_nodes`).Scan(&n)
+	} else {
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM kg_nodes WHERE (workspace_id=? OR workspace_id='default')`, libraryID).Scan(&n)
+	}
+	return n
+}
+
+// RenameNode changes an entity's display name and its normalized disambiguation
+// key. The chromem entity doc is left as-is (orphan vector; harmless — recall
+// joins SQLite by id).
+func (s *Store) RenameNode(id, name string) error {
+	norm := normalizeName(name)
+	if norm == "" {
+		return fmt.Errorf("empty name")
+	}
+	_, err := s.db.Exec(`UPDATE kg_nodes SET name = ?, name_raw = ? WHERE id = ?`, norm, name, id)
+	return err
+}
+
+// MergeNodes folds dropID into keepID: re-points its edges to keepID, removes the
+// self-loops and duplicate (src,dst,type) edges the merge introduces, then deletes
+// the dropID node.
+func (s *Store) MergeNodes(keepID, dropID string) error {
+	if keepID == dropID {
+		return fmt.Errorf("cannot merge a node into itself")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE kg_edges SET src_id = ? WHERE src_id = ?`, keepID, dropID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE kg_edges SET dst_id = ? WHERE dst_id = ?`, keepID, dropID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kg_edges WHERE src_id = dst_id`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kg_edges WHERE id NOT IN (SELECT MIN(id) FROM kg_edges GROUP BY src_id, dst_id, type)`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kg_nodes WHERE id = ?`, dropID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// GraphStats holds aggregate stats for the UI header.
+type GraphStats struct {
+	EdgesPerType map[string]int `json:"edgesPerType"`
+	TopHubs     []GraphHub      `json:"topHubs"`
+}
+
+// GraphHub is a top-degree entity.
+type GraphHub struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Degree int    `json:"degree"`
+}
+
+// Stats returns edge counts per type (top 10) and top-degree hub nodes (current edges only).
+func (s *Store) Stats() (*GraphStats, error) {
+	out := &GraphStats{EdgesPerType: map[string]int{}}
+	rows, err := s.db.Query(`SELECT type, COUNT(*) FROM kg_edges WHERE valid_to IS NULL GROUP BY type ORDER BY COUNT(*) DESC LIMIT 10`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var t string
+		var c int
+		if err := rows.Scan(&t, &c); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out.EdgesPerType[t] = c
+	}
+	rows.Close()
+	hrows, err := s.db.Query(`SELECT n.id, COALESCE(n.name_raw, n.name), COUNT(e.id) AS deg
+		FROM kg_nodes n
+		LEFT JOIN kg_edges e ON (e.src_id = n.id OR e.dst_id = n.id) AND e.valid_to IS NULL
+		GROUP BY n.id ORDER BY deg DESC LIMIT 5`)
+	if err != nil {
+		return nil, err
+	}
+	for hrows.Next() {
+		var h GraphHub
+		if err := hrows.Scan(&h.ID, &h.Name, &h.Degree); err != nil {
+			hrows.Close()
+			return nil, err
+		}
+		out.TopHubs = append(out.TopHubs, h)
+	}
+	return out, hrows.Close()
+}
+
+// CurrentEdgeCount returns the number of currently-valid edges.
+func (s *Store) CurrentEdgeCount() int { return s.CurrentEdgeCountByLibrary("") }
+func (s *Store) CurrentEdgeCountByLibrary(libraryID string) int {
+	var n int
+	if libraryID == "" {
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL`).Scan(&n)
+	} else {
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM kg_edges WHERE valid_to IS NULL AND (workspace_id=? OR cross_tags LIKE ?)`, libraryID, "%"+libraryID+"%").Scan(&n)
+	}
+	return n
+}
+
+// dedupEdges consolidates duplicate valid edges (same src+dst+type) into a
+// single row by summing weights. One-shot migration; safe to call after the
+// weight column has been added.
+func (s *Store) dedupEdges() error {
+	rows, err := s.db.Query(`SELECT src_id, dst_id, type, COUNT(*) AS cnt, SUM(weight) AS total
+		FROM kg_edges WHERE valid_to IS NULL
+		GROUP BY src_id, dst_id, type
+		HAVING COUNT(*) > 1`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type dup struct{ src, dst, typ string; cnt, total int }
+	var dups []dup
+	for rows.Next() {
+		var d dup
+		if err := rows.Scan(&d.src, &d.dst, &d.typ, &d.cnt, &d.total); err != nil {
+			return err
+		}
+		dups = append(dups, d)
+	}
+	for _, d := range dups {
+		// Keep one row and set its weight to the total.
+		var keeperID string
+		if err := s.db.QueryRow(`SELECT MIN(id) FROM kg_edges
+			WHERE src_id=? AND dst_id=? AND type=? AND valid_to IS NULL`,
+			d.src, d.dst, d.typ).Scan(&keeperID); err != nil {
+			continue
+		}
+		_, _ = s.db.Exec(`UPDATE kg_edges SET weight = ? WHERE id = ?`, d.total, keeperID)
+		_, _ = s.db.Exec(`DELETE FROM kg_edges
+			WHERE src_id=? AND dst_id=? AND type=? AND valid_to IS NULL AND id != ?`,
+			d.src, d.dst, d.typ, keeperID)
+	}
+	return nil
+}
+
+// SearchNodesByKeyword returns nodes whose name contains the query (LIKE search).
+func (s *Store) SearchNodesByKeyword(query string, limit int) ([]GraphNode, error) {
+	if limit <= 0 { limit = 10 }
+	rows, err := s.db.Query(`SELECT id, type, name, created_at FROM kg_nodes
+		WHERE name LIKE ? OR name_raw LIKE ? ORDER BY name LIMIT ?`,
+		"%"+query+"%", "%"+query+"%", limit)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var out []GraphNode
+	for rows.Next() {
+		var n GraphNode
+		if err := rows.Scan(&n.ID, &n.Type, &n.Name, &n.CreatedAt); err != nil { return nil, err }
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// ListEdgesForNode returns currently-valid edges connected to a node (both directions).
+func (s *Store) ListEdgesForNode(nodeID string, limit int) ([]GraphEdge, error) {
+	if limit <= 0 { limit = 10 }
+	rows, err := s.db.Query(`SELECT e.id, e.src_id, e.dst_id, e.type, e.valid_from, COALESCE(e.valid_to,0), e.recorded_at, e.cross_tags, e.weight,
+		COALESCE(sn.name_raw, sn.name), COALESCE(dn.name_raw, dn.name)
+		FROM kg_edges e
+		JOIN kg_nodes sn ON sn.id = e.src_id
+		JOIN kg_nodes dn ON dn.id = e.dst_id
+		WHERE (e.src_id=? OR e.dst_id=?) AND e.valid_to IS NULL
+		ORDER BY e.weight DESC LIMIT ?`, nodeID, nodeID, limit)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var out []GraphEdge
+	for rows.Next() {
+		var ge GraphEdge
+		if err := rows.Scan(&ge.ID, &ge.SrcID, &ge.DstID, &ge.Type, &ge.ValidFrom, &ge.ValidTo, &ge.RecordedAt, &ge.CrossTags, &ge.Weight, &ge.SrcName, &ge.DstName); err != nil { return nil, err }
+		out = append(out, ge)
+	}
+	return out, rows.Err()
+}
+
+// RenameEdge updates the relation type (predicate) of an edge.
+func (s *Store) RenameEdge(id, newType string) error {
+	_, err := s.db.Exec(`UPDATE kg_edges SET type = ? WHERE id = ?`, newType, id)
+	return err
+}

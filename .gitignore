@@ -1,0 +1,45 @@
+# Rust
+engine/target/
+
+# Go
+*.exe
+*.exe~
+build/bin/
+
+# Frontend
+frontend/dist/
+frontend/node_modules/
+frontend/wailsjs/
+
+# Runtime data (logs, downloaded models, etc.)
+data/
+
+# Binary dependencies
+*.dll
+third_party/
+
+# Wails build artifacts
+build/windows/
+*.manifest
+*.sgo
+
+# Build artifacts
+frontend/package.json.md5
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backups
+*.bak
+build/appicon.png
+*.syso
