@@ -1,5 +1,5 @@
 ﻿import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { marked } from 'marked'
 import { agentsApi } from '../api/agents'
 import type { LocalAgent } from '../api/agents'
@@ -7,7 +7,8 @@ import { memoryApi } from '../api/memory'
 import { wikiApi } from '../api/wiki'
 import { knowledgeApi } from '../api/knowledge'
 import { useActiveLibrary } from '../composables/useActiveLibrary'
-import type { MemorySession } from '../api/memory'
+import { useAsyncStore } from './asyncStore'
+import type { MemorySession, MemoryMessage } from '../api/memory'
 
 // Cross-view: last graph recall trace (seed/edge ids). The Knowledge viewer reads
 // this to highlight which part of the graph the most recent chat answer used.
@@ -16,6 +17,7 @@ export const lastGraphTrace = ref<{ seedIds: string[]; edgeIds: string[] }>({ se
 // ── Types ──
 
 export interface ChatMessage {
+  id?: string                    // stable key for v-for; preserved from backend or generated
   role: 'user' | 'assistant' | 'tool' | 'system'
   content: string
   tool_calls?: ToolCall[]
@@ -227,12 +229,64 @@ export const useChatStore = defineStore('chat', () => {
   const pendingFiles = ref<PendingFile[]>([])
   const hasMoreMessages = ref(false)       // true when earlier messages exist but aren't loaded
   const totalMessageCount = ref(0)         // total messages in current session
+  let _chatBoxRef: HTMLElement | null = null
+  let _loadingMore = false
   const thinkMode = ref(true)              // extended thinking toggle, default ON
   const thinkEffort = ref<'high' | 'max'>('high')  // effort level (high=default, max=deep)
   const stopRequested = ref(false)          // set to true to stop current generation
   const currentStreamId = ref('')            // track active stream for cancellation
   const reasoningContent = ref<Record<number, string>>({})  // reasoning per message index
   const compressedAt = ref<number>(-1)  // message index where auto-compression happened
+  const compressionMarker = ref<number>(-1) // index of the compression divider (apiMsgs starts after this)
+  const showCompressedHistory = ref(false) // user toggled to view messages before marker
+  const historyVisibleCount = ref(0)        // progressive reveal: how many history msgs to show
+  const HISTORY_BATCH = 20                  // messages per scroll-up batch
+  function revealMoreHistory(): number {
+    if (compressionMarker.value < 0) return 0
+    const maxVisible = compressionMarker.value
+    if (historyVisibleCount.value >= maxVisible) return 0
+    const prev = historyVisibleCount.value
+    historyVisibleCount.value = Math.min(maxVisible, prev + HISTORY_BATCH)
+    showCompressedHistory.value = true
+    return historyVisibleCount.value - prev
+  }
+  /** Find a clean conversation-round boundary near the given position. */
+  function _findRoundBoundary(nearPct: number): number {
+    const target = Math.floor(messages.value.length * nearPct)
+    // Scan forward from target for a user message that follows a completed round.
+    for (let i = Math.max(4, target); i < messages.value.length - 2; i++) {
+      const m = messages.value[i]
+      if (m.role !== 'user') continue
+      // This user message starts a new round. Check that the previous round is
+      // complete: the message before this user should be assistant or tool (not
+      // a dangling assistant with pending tool_calls).
+      const prev = messages.value[i - 1]
+      if (!prev) continue
+      if (prev.role === 'assistant') {
+        // If assistant has tool_calls, it must have results (final answer after tools).
+        if (prev.tool_calls?.length && !prev.toolResults?.length) continue
+        return i
+      }
+      if (prev.role === 'tool') return i // tool result = previous round complete
+    }
+    // Fallback: just find any user message.
+    for (let i = Math.max(4, target); i < messages.value.length; i++) {
+      if (messages.value[i].role === 'user') return i
+    }
+    return target
+  }
+
+  /** Count conversation rounds (user messages) in the given message range. */
+  function _countRounds(msgs: ChatMessage[]): number {
+    let count = 0
+    for (const m of msgs) if (m.role === 'user') count++
+    return count
+  }
+
+  function hideCompressedHistory() {
+    showCompressedHistory.value = false
+    historyVisibleCount.value = 0
+  }
 
   // ── Getters ──
 
@@ -263,91 +317,580 @@ export const useChatStore = defineStore('chat', () => {
     return !!(p && p.endpoint && p.apiKey && p.model)
   })
 
-  // ── Context window management ──
+  // ═══════════════════════════════════════════════════════════════════════
+  // ── Context Window Management ──
+  //
+  // Based on:
+  //   MemGPT (Packer et al., arXiv 2310.08560) — virtual context / paging
+  //   Lost in the Middle (Liu et al., TACL 2023, arXiv 2307.03172) — U-shaped attention
+  //   CoMem (Zhang et al., ICML 2026) — async decoupled compression pipeline
+  //   Factory AI (2025) — structured incremental summaries
+  //   Anthropic Context Engineering (2025) — compaction + note-taking
+  //
+  // Architecture:
+  //   ┌─────────────────────────────────────────────────────┐
+  //   │  CONTEXT BUDGET MODEL (modeled on MemGPT tiers)     │
+  //   ├─────────────────────────────────────────────────────┤
+  //   │  FIXED OVERHEAD (counted, rarely change):           │
+  //   │    System Prompt     10-15%  (identity + domain)    │
+  //   │    Tool Definitions   8-12%  (enabled tools)        │
+  //   │    Core Memory        3-5%   (locked facts)         │
+  //   │                                                     │
+  //   │  DYNAMIC CONTENT (per-session, grows):              │
+  //   │    Recall / RAG       5-20%  (memory + KB chunks)   │
+  //   │    Conversation       40-60% (recent turns raw)     │
+  //   │    Tool I/O           5-15%  (current turn results) │
+  //   │                                                     │
+  //   │  RESERVED (not sent, but budgeted):                 │
+  //   │    Model Response     10-15% (generation headroom)  │
+  //   │    Thinking Tokens     5-10% (if think mode on)     │
+  //   │    Safety Margin       5-8%  (estimation variance)  │
+  //   └─────────────────────────────────────────────────────┘
+  //
+  //  Staged triggers (evidence-backed thresholds):
+  //    < 50%  → Normal operation
+  //    50%    → Background pre-compute summary (async, non-blocking)
+  //    65%    → Inject soft system-note (LLM self-manages)
+  //    80%    → Apply pre-computed summary + truncate (instant)
+  //    90%    → Hard truncation (safety net, drop from middle first)
+  // ═══════════════════════════════════════════════════════════════════════
 
-  /** Estimated token count: ~3 chars/token for English, ~1.5 for CJK. Heuristic. */
+  /**
+   * Estimate token count using a conservative heuristic calibrated for BPE
+   * tokenizers (DeepSeek / OpenAI / Claude all use similar sub-word schemes).
+   *
+   * Observed ratios (conservative → slight over-estimate for safety):
+   *   Chinese (CJK):  ~0.8–1.5 chars/token  → use 1.0
+   *   English ASCII:  ~2.5–4.0 chars/token  → use 2.5
+   *   Code / mixed:   ~1.5–3.0 chars/token  → treated as CJK-like
+   *
+   * 1.15× safety margin covers estimation variance.
+   */
+  const EST_SAFETY = 1.15
+  const MSG_OVERHEAD = 4 // role label + JSON framing per message in the API array
+
   function estimateTokens(text: string): number {
+    if (!text) return 0
     let cjk = 0, ascii = 0
     for (const ch of text) {
       const code = ch.charCodeAt(0)
-      if (code >= 0x4E00 && code <= 0x9FFF || code >= 0x3000 && code <= 0x303F || code >= 0xFF00) {
+      if ((code >= 0x4E00 && code <= 0x9FFF) ||
+          (code >= 0x3400 && code <= 0x4DBF) ||
+          (code >= 0x3000 && code <= 0x303F) ||
+          (code >= 0xFF00 && code <= 0xFFEF) ||
+          (code >= 0x2000 && code <= 0x206F) ||
+          code > 127) {
         cjk++
       } else if (code < 128) {
         ascii++
-      } else {
-        cjk++ // treat other non-ASCII as CJK-like
       }
     }
-    return Math.ceil(cjk / 1.5 + ascii / 3.5)
+    return Math.ceil(EST_SAFETY * (cjk / 1.0 + ascii / 2.5))
   }
 
-  const contextTokens = computed(() => {
-    let total = 0
-    for (const m of messages.value) {
-      total += estimateTokens(m.content || '')
-    }
-    return total
-  })
+  // ── Token counters (reactive — set in chatLoop, tracked by computed) ──
+  const _sysPromptTokens = ref(0)   // system prompt
+  const _toolDefTokens = ref(0)     // tool definitions (JSON schemas)
+  const _memRagTokens = ref(0)      // memory recall + RAG chunks injected into system prompt
 
-  /** Target window: 64K. MemGPT research shows hierarchical summarization keeps
-   *  quality high at 50-75% of model's effective context. DeepSeek v4 handles 64K
-   *  reliably. Overflow triggers pause→archive→summarize→resume cycle. */
-  const contextTarget = 64000
-  /** Absolute maximum the model supports (fallback if no capability probe data). */
+  /**
+   * Model's absolute context limit (from capability probe or known defaults).
+   * Must be defined first — contextTarget references it.
+   */
   const contextLimit = computed(() => {
     const p = activeProvider.value
     if (!p) return 128000
     const caps = p.modelCapabilities?.[p.model]
     if (caps?.maxContextTokens && caps.maxContextTokens > 0) return caps.maxContextTokens
-    if (p.model?.includes('v4') || p.model?.includes('deepseek')) return 1000000
+    if (p.model?.includes('v4') || p.model?.includes('deepseek')) return 1_000_000
     return 128000
   })
-  const contextPct = computed(() => Math.round((contextTokens.value / contextTarget) * 100))
-  const contextLevel = computed(() => contextPct.value < 60 ? 'ok' : contextPct.value < 85 ? 'warn' : 'critical')
 
-  /** MemGPT-style overflow handler: warn → self-save → archive → summarize → resume. */
-  async function maybeCompressContext() {
-    if (contextPct.value < 85 || busy.value) return
-    const cutoff = Math.floor(messages.value.length * 0.6)
-    if (cutoff < 6) return
+  /**
+   * Model-aware dynamic context target (论文论证).
+   *
+   * ┌─ STRING (ICLR 2025):       小模型有效上下文仅 30-50% claimed limit
+   * │─ CNOE production (2025):   生产环境 50-80% 视场景
+   * │─ MCP agent study (2025):   DeepSeek V3 平均 78K prompt tokens/task
+   * │─ DeepSeek V3 paper:       128K→完美 NIAH; V3.1 128K verified
+   * │─ DeepSeek V4 API:         1M context, 384K max output
+   * │─ Lost in the Middle:      中间位置注意力最低，退化在 32K+ 开始
+   * └─ 结论: target = limit × model-aware, tiered ratio
+   *
+   * Ratios by model family:
+   *   DeepSeek V4 (1M):   保守 15% = 150K  (1M 未经充分独立验证)
+   *   DeepSeek ≤128K:     75% of 128K = 96K  (V3 实测完美 NIAH)
+   *   Claude 200K:        60% = 120K
+   *   GPT-4o 128K:        60% =  77K
+   *   Qwen/GLM ≥128K:     60%
+   *   小模型 ≤32K:        50% (STRING paper)
+   *   中型 32-128K:        55%
+   */
+  const contextTarget = computed(() => {
+    const limit = contextLimit.value
+    const p = activeProvider.value
+    const model = (p?.model || '').toLowerCase()
+    const name = (p?.name || '').toLowerCase()
 
-    // Phase 1: Warn the LLM and let it self-save key facts before compression.
-    // The LLM can call memory_save tool to persist critical information.
-    const warnMsg: ChatMessage = {
-      role: 'system' as const,
-      content: '⚠ 上下文使用率达 ' + contextPct.value + '%，即将自动压缩早期对话。如有需要长期记住的关键信息，请调用 memory_save 保存。'
+    // DeepSeek V4 (1M): use 15% = 150K (conservative for unverified 1M)
+    if (limit >= 500_000 && (name.includes('deepseek') || model.includes('deepseek'))) {
+      return Math.floor(limit * 0.15) // 150K for 1M
     }
-    messages.value.splice(cutoff, 0, warnMsg)
-
-    // Phase 2: Archive — save oldest messages to session DB.
-    const oldMsgs = messages.value.slice(0, cutoff)
-    let dialogue = ''
-    for (const m of oldMsgs) {
-      if (m.role === 'user') dialogue += '用户: ' + m.content + '\n'
-      else if (m.role === 'assistant') dialogue += '助手: ' + (m.content || '').slice(0, 300) + '\n'
+    // DeepSeek ≤128K (V3, R1): 75% of verified 128K = 96K
+    if (name.includes('deepseek') || model.includes('deepseek')) {
+      return Math.floor(Math.min(limit, 128_000) * 0.75)
     }
-    if (!dialogue.trim()) return
+    if (name.includes('claude') || name.includes('anthropic') || model.includes('claude')) {
+      return Math.floor(limit * 0.60)
+    }
+    if (name.includes('openai') || model.includes('gpt') || model.includes('o1') || model.includes('o3')) {
+      return Math.floor(limit * 0.60)
+    }
+    if (limit >= 128_000) return Math.floor(limit * 0.60)
+    if (limit <= 32_000)  return Math.floor(limit * 0.50)
+    return Math.floor(limit * 0.55)
+  })
 
-    // Phase 3: Summarize via extraction provider.
+  /**
+   * Reserved budget: tokens set aside for the model's own output.
+   *
+   * IMPORTANT (DeepSeek API docs, verified):
+   *   Thinking/reasoning tokens are part of completion_tokens (OUTPUT),
+   *   NOT prompt_tokens (INPUT). They do NOT consume the context window —
+   *   they consume the max_tokens output budget. The reasoning_content from
+   *   previous turns is stripped and NOT fed back into subsequent requests.
+   *
+   *   So we only reserve for: model response + JSON overhead + safety.
+   */
+  const contextReserved = computed(() => {
+    const target = contextTarget.value
+    let r = Math.floor(target * 0.10)  // 10% base for model response
+    r += Math.floor(target * 0.05)     // 5% JSON framing + safety margin
+    return r
+  })
+
+  /** Usable budget: what we can actually send (target minus reserved). */
+  const contextUsable = computed(() => Math.max(0, contextTarget.value - contextReserved.value))
+
+  // ── Computed context state ──
+  /** Messages BEFORE the compression marker (hidden history, not sent to API). */
+  const historyMessages = computed(() => {
+    const marker = compressionMarker.value
+    if (marker < 0) return []
+    return messages.value.slice(0, marker)
+  })
+  /** Number of conversation rounds in the hidden history. */
+  const historyRoundCount = computed(() => _countRounds(historyMessages.value))
+  /** Messages that will actually be sent to the API (after compression marker). */
+  const apiMessages = computed(() => {
+    const marker = compressionMarker.value
+    if (marker < 0) return messages.value
+    // Include the compression summary (marker message) + everything after it.
+    return messages.value.slice(marker)
+  })
+
+  const contextTokens = computed(() => {
+    let total = _sysPromptTokens.value + _toolDefTokens.value + _memRagTokens.value
+    for (const m of apiMessages.value) {
+      total += estimateTokens(m.content || '') + MSG_OVERHEAD
+      if (m.tool_calls?.length) total += m.tool_calls.length * 20
+    }
+    const reasoningTokens = Object.values(reasoningContent.value).reduce((s, t) => s + estimateTokens(t), 0)
+    return total - reasoningTokens
+  })
+
+  /** Per-round context growth logging (helps diagnose what's consuming tokens). */
+  let _lastLoggedTokens = 0
+  function _logContextGrowth(round: number) {
+    const now = contextTokens.value
+    const delta = now - _lastLoggedTokens
+    const bd = contextBreakdown.value
+    console.log('[context] round ' + round
+      + ' | total=' + fmtTokens(now) + ' (Δ+' + fmtTokens(delta) + ')'
+      + ' | sys=' + fmtTokens(bd.system) + ' tools=' + fmtTokens(bd.tools)
+      + ' | mem=' + fmtTokens(bd.memory) + ' msgs=' + fmtTokens(bd.messages)
+      + ' | pct=' + contextPct.value + '%'
+      + ' | toolMsgs=' + messages.value.filter(m => m.role === 'tool').length)
+    _lastLoggedTokens = now
+  }
+
+  /** Context budget breakdown (shown in progress-bar tooltip). */
+  const contextBreakdown = computed(() => ({
+    system: _sysPromptTokens.value,
+    tools: _toolDefTokens.value,
+    memory: _memRagTokens.value,
+    messages: contextTokens.value - _sysPromptTokens.value - _toolDefTokens.value - _memRagTokens.value,
+    reserved: contextReserved.value,
+    total: contextTokens.value,
+    usable: contextUsable.value,
+    limit: contextLimit.value,
+    target: contextTarget.value,
+  }))
+
+  /** % of usable budget (for display label). */
+  const contextPct = computed(() =>
+    Math.min(999, Math.round((contextTokens.value / Math.max(1, contextUsable.value)) * 100)))
+  /** % for progress bar width (capped at 100%). */
+  const contextBarPct = computed(() => Math.min(100, contextPct.value))
+  /** % of model's absolute limit. */
+  const contextLimitPct = computed(() =>
+    Math.round((contextTokens.value / Math.max(1, contextLimit.value)) * 100))
+
+  const contextLevel = computed(() => {
+    const p = contextPct.value
+    if (p >= 90) return 'danger'
+    if (p >= 80) return 'critical'
+    if (p >= 65) return 'warn'
+    return 'ok'
+  })
+
+  /**
+   * Structured summary prompt — produces sectioned output so compressed context
+   * preserves critical information in a searchable format (Claude compaction style).
+   * Sections: decisions, unsolved, files, constraints.
+   */
+  const STRUCTURED_SUMMARY_PROMPT = `用中文总结以下对话，按固定格式输出（不要用markdown标题，用【】标号）：
+
+【关键决策】- 用户做了什么重要决定？选择了什么方案？每条一行。
+【未解决问题】- 哪些问题还没解决？错误还在排查？每条一行。
+【涉及文件】- 提到了哪些文件路径？改了哪些代码？每条一行。
+【约束条件】- 用户提出了什么硬性要求？预算/技术栈/时间限制？
+【下一步】- 接下来应该做什么？
+
+每条保持简洁（10-20字），总字数不超过300字。只记事实不推测。保留具体的数字、文件名、API名称、错误信息原文。`
+
+  // ── Async pre-compute state ──
+  /** Cached summary from background compression (CoMem-style async pipeline). */
+  let _pendingSummary: string | null = null
+  let _precomputing = false
+
+  /**
+   * Fire-and-forget background summarization. When the result arrives, it's
+   * cached in _pendingSummary. The next compression trigger applies it instantly
+   * without blocking the chat loop (CoMem-style k-step-off pipeline).
+   */
+  async function _precomputeSummary(dialogue: string) {
+    if (_precomputing || _pendingSummary) return
+    _precomputing = true
     try {
       const go = window.go.app.App
-      const resp = await go.ChatProxy(
-        [{ role: 'system', content: '用中文总结以下对话的关键信息、决定和未解决问题。保留具体数字、文件名、技术决策。最多 300 字。' },
-         { role: 'user', content: dialogue }],
-        [] as any
-      )
+      const PRE_COMPUTE_TIMEOUT = 30_000
+      const resp = await Promise.race([
+        go.ChatProxy(
+          [{ role: 'system', content: STRUCTURED_SUMMARY_PROMPT },
+           { role: 'user', content: dialogue }],
+          [] as any
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('precompute timeout')), PRE_COMPUTE_TIMEOUT)),
+      ])
       const summary = resp?.choices?.[0]?.message?.content || ''
       if (summary) {
-        // Phase 4: Compress + Archive.
-        messages.value = [
-          { role: 'system' as const, content: '📝 早期对话摘要：' + summary },
-          ...messages.value.slice(cutoff),
-        ]
-        compressedAt.value = 0
-        // Save to long-term memory so future memory_recall can retrieve it.
+        _pendingSummary = summary
         memoryApi.saveSummary(summary).catch(() => {})
       }
-    } catch (e) { console.error('[context] compression failed:', errMsg(e)) }
+    } catch (e) { console.error('[context] precompute failed:', errMsg(e)) }
+    finally { _precomputing = false }
+  }
+
+  /**
+   * Force-compress: user clicked the button → do synchronous summarisation
+   * regardless of percentage stage. Uses cached summary if available.
+   */
+  /**
+   * Logical compression: keep full history in messages.value for scrolling,
+   * but mark a split point so apiMsgs only includes summary + recent context.
+   * Old messages remain viewable in the UI — only the API context is reduced.
+   */
+  async function _forceCompress(): Promise<string> {
+    // Find a clean round boundary near 60%.
+    const cutoff = _findRoundBoundary(0.6)
+    if (cutoff < 4) return ''
+
+    // Collect any existing compression summaries (from previous compressions).
+    let priorSummary = ''
+    for (const m of messages.value.slice(0, cutoff)) {
+      if (m.role === 'system' && (m.content.includes('📦 上下文压缩') || m.content.includes('上下文已截断'))) {
+        priorSummary += m.content.replace(/^━━━.*━━━\n*/, '') + '\n'
+      }
+    }
+
+    // ── Summarise the older portion ──
+    const summary = _pendingSummary
+    _pendingSummary = null
+    let summaryText = summary
+
+    if (!summaryText) {
+      const oldMsgs = messages.value.slice(0, cutoff)
+      let dialogue = ''
+      for (const m of oldMsgs) {
+        if (m.role === 'user') dialogue += '用户: ' + m.content + '\n'
+        else if (m.role === 'assistant') dialogue += '助手: ' + (m.content || '').slice(0, 300) + '\n'
+      }
+      if (!dialogue.trim() && !priorSummary) return ''
+      try {
+        // Prepend prior summary so the new summary accumulates (cumulative compression).
+        const summaryInput = priorSummary
+          ? '【之前的压缩摘要】\n' + priorSummary + '\n\n【最近对话】\n' + dialogue
+          : dialogue
+        const resp = await window.go.app.App.ChatProxy(
+          [{ role: 'system', content: STRUCTURED_SUMMARY_PROMPT },
+           { role: 'user', content: summaryInput }],
+          [] as any
+        )
+        summaryText = resp?.choices?.[0]?.message?.content || ''
+      } catch (e) { console.error('[context] force compress failed:', errMsg(e)); return '' }
+    }
+
+    if (!summaryText) return ''
+
+    // ── Insert divider + summary as a new message (don't delete old ones!) ──
+    const dividerId = _tempId()
+    const header = '━━━ 📦 上下文压缩 ' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + ' ━━━'
+    messages.value.splice(cutoff, 0, {
+      id: dividerId, role: 'system' as const,
+      content: header + '\n\n' + summaryText,
+    })
+    compressionMarker.value = cutoff // split point: apiMsgs starts after this
+    compressedAt.value = cutoff
+    // Don't load more history beyond the marker (it's been summarised).
+    hasMoreMessages.value = false
+    _olderBuffer = []
+
+    // ── Persist only the summary message to DB (don't delete anything) ──
+    const sid = currentSessionId.value
+    if (sid) {
+      memoryApi.messageAppend(sid, 'system', header + '\n\n' + summaryText, '').catch(() => {})
+      memoryApi.saveSummary(summaryText).catch(() => {})
+    }
+
+    // ── Re-inject ReAct reminder ──
+    _reinjectReAct()
+
+    return 'compressed'
+  }
+
+  /**
+   * Staged context management (MemGPT-inspired, CoMem-async-augmented):
+   *
+   *   Stage 1 (50%):  Fire background pre-compute summary (async, zero blocking).
+   *   Stage 2 (65%):  Inject soft system note — LLM self-manages.
+   *   Stage 3 (80%):  Apply cached summary + truncate (instant if cached, else sync).
+   *   Stage 4 (90%):  Hard truncation — drop oldest from the MIDDLE first
+   *                    (respecting Lost-in-the-Middle: keep primacy + recency).
+   *
+   * When `force` is true the busy guard is skipped (used between chat-loop rounds).
+   */
+  /**
+   * Returns a description of what happened (for user feedback).
+   *   ''           = nothing done (below threshold or busy)
+   *   'precompute' = background pre-compute fired
+   *   'warned'     = soft warning injected
+   *   'compressed' = summary applied / messages compacted
+   *   'truncated'  = hard truncation applied
+   */
+  async function maybeCompressContext(force = false): Promise<string> {
+    const pct = contextPct.value
+    if (pct < 50 || (!force && busy.value)) return ''
+
+    // ── Force mode: user explicitly clicked the button → do real work now ──
+    if (force) {
+      return await _forceCompress()
+    }
+
+    // ── Stage 1: Background pre-compute (50-65%) ──
+    if (pct < 65 && pct >= 50) {
+      const oldMsgs = messages.value.slice(0, Math.floor(messages.value.length * 0.5))
+      let dialogue = ''
+      for (const m of oldMsgs) {
+        if (m.role === 'user') dialogue += '用户: ' + m.content + '\n'
+        else if (m.role === 'assistant') dialogue += '助手: ' + (m.content || '').slice(0, 300) + '\n'
+      }
+      if (dialogue.trim()) _precomputeSummary(dialogue)
+      return 'precompute'
+    }
+
+    // ── Stage 2: Soft warning (65-80%) ──
+    if (pct < 80 && pct >= 65) {
+      if (compressedAt.value >= 0) return 'warned' // already warned
+      const warnMsg: ChatMessage = {
+        id: _tempId(), role: 'system' as const,
+        content: '⚠ 上下文使用率 ' + pct + '%（可用 ' + fmtTokens(contextUsable.value) + ' / 模型上限 ' + fmtTokens(contextLimit.value) + '）。请尽量简洁回复，避免不必要的工具调用。'
+      }
+      messages.value.push(warnMsg)
+      compressedAt.value = messages.value.length - 1
+      return 'warned'
+    }
+
+    // ── Stage 3: Apply compression (80-90%) ──
+    if (pct < 90 && pct >= 80) {
+      if (compressedAt.value > 0 && messages.value.length - compressedAt.value < 4) return '' // anti-thrash
+
+      const summary = _pendingSummary
+      _pendingSummary = null
+
+      const cutoff = Math.floor(messages.value.length * 0.6)
+      if (cutoff < 6) return ''
+
+      if (summary) {
+        messages.value = [
+          { id: _tempId(), role: 'system' as const, content: '📝 早期对话摘要：' + summary },
+          ...messages.value.slice(cutoff),
+        ]
+        compressedAt.value = messages.value.length
+        return 'compressed'
+      }
+
+      // Fallback: synchronous summarization.
+      const oldMsgs = messages.value.slice(0, cutoff)
+      let dialogue = ''
+      for (const m of oldMsgs) {
+        if (m.role === 'user') dialogue += '用户: ' + m.content + '\n'
+        else if (m.role === 'assistant') dialogue += '助手: ' + (m.content || '').slice(0, 300) + '\n'
+      }
+      if (!dialogue.trim()) return ''
+      try {
+        const go = window.go.app.App
+        const resp = await go.ChatProxy(
+          [{ role: 'system', content: STRUCTURED_SUMMARY_PROMPT },
+           { role: 'user', content: dialogue }],
+          [] as any
+        )
+        const s = resp?.choices?.[0]?.message?.content || ''
+        if (s) {
+          messages.value = [
+            { id: _tempId(), role: 'system' as const, content: '📝 早期对话摘要：' + s },
+            ...messages.value.slice(cutoff),
+          ]
+          compressedAt.value = messages.value.length
+          _cleanOrphanToolMessages()
+          _reinjectReAct()
+          memoryApi.saveSummary(s).catch(() => {})
+          return 'compressed'
+        }
+      } catch (e) { console.error('[context] sync compression failed:', errMsg(e)) }
+      return ''
+    }
+
+    // ── Stage 4: Hard truncation (≥90%) ──
+    if (pct >= 90) {
+      const didTruncate = _truncateForLimit()
+      return didTruncate ? 'truncated' : ''
+    }
+    return ''
+  }
+
+  /**
+   * Hard truncation guard — called before every API request.
+   *
+   * Uses a "drop-from-middle" strategy informed by Lost-in-the-Middle research:
+   *   - System messages stay at position 0 (primacy — highest attention)
+   *   - Last N conversation turns stay at the end (recency — second-highest)
+   *   - Tool results at the tail are kept (needed for API correctness)
+   *   - Messages are dropped from the MIDDLE of the conversation array
+   *     (the attention dead zone — Liu et al. shows models ignore middle content)
+   *
+   * Reserves ~10% for the model response + thinking.
+   */
+  /**
+   * Hard truncation guard — now uses LOGICAL truncation (adds a compression
+   * marker instead of deleting messages). History stays viewable in the UI.
+   */
+  function _truncateForLimit(): boolean {
+    const limit = contextLimit.value
+    const safeLimit = Math.floor(limit * 0.88)
+    if (contextTokens.value <= safeLimit) return false
+
+    // If we already have a recent marker, don't add another.
+    if (compressionMarker.value > 0 &&
+        messages.value.length - compressionMarker.value < 10) return false
+
+    // Use the same clean-boundary logic as compression.
+    const cutoff = _findRoundBoundary(0.5)
+    if (cutoff < 4) return false
+
+    // Insert a minimal truncation marker (no LLM summary — just a note).
+    const header = '⚠ 上下文已截断：早期消息已移至历史（适配模型限制 ' + fmtLimit(limit) + '）'
+    messages.value.splice(cutoff, 0, {
+      id: _tempId(), role: 'system' as const,
+      content: header,
+    })
+    compressionMarker.value = cutoff
+    compressedAt.value = cutoff
+
+    return true
+  }
+
+  /**
+   * Strip tool messages that no longer have a matching assistant message with
+   * tool_calls. These orphans cause HTTP 400 ("Messages with role 'tool' must
+   * be a response to a preceding message with 'tool_calls'").
+   * Called after any message manipulation that may drop assistant messages.
+   */
+  function _cleanOrphanToolMessages() {
+    const validIds = new Set<string>()
+    for (const m of messages.value) {
+      if (m.role === 'assistant' && m.tool_calls) {
+        for (const tc of m.tool_calls) validIds.add(tc.id)
+      }
+    }
+    const before = messages.value.length
+    messages.value = messages.value.filter(m => {
+      if (m.role !== 'tool') return true
+      return m.tool_call_id ? validIds.has(m.tool_call_id) : true
+    })
+    if (messages.value.length < before) {
+      console.warn('[context] cleaned ' + (before - messages.value.length) + ' orphan tool messages')
+    }
+  }
+
+  /**
+   * After compression, re-inject a concise ReAct reminder so the model doesn't
+   * drift from the framework (Claude Code PostCompact hook pattern).
+   */
+  function _reinjectReAct() {
+    if (compressedAt.value <= 0) return
+    const since = messages.value.length - compressedAt.value
+    if (since > 3) return
+    const recent = messages.value.slice(-4)
+    if (recent.some(m => m.role === 'system' && m.content.includes('ReAct 框架提醒'))) return
+    messages.value.push({
+      id: _tempId(), role: 'system' as const,
+      content: '【ReAct 框架提醒】上下文已压缩。继续遵循：1.分析需求 → 2.调用工具 → 3.观察结果 → 4.重复 → 5.最终回答。先思考再行动，工具失败换方案。'
+    })
+  }
+
+  /**
+   * Replace verbose tool results from older rounds with compact stubs.
+   * Preserves the tool-role message (needed for API tool_call pairing) but
+   * truncates the JSON content to save context tokens.
+   */
+  function _pruneOldToolResults(currentRound: number) {
+    const MAX_AGE = 3
+    if (currentRound <= MAX_AGE) return
+    let asstTurn = 0
+    for (let i = messages.value.length - 1; i >= 0; i--) {
+      const m = messages.value[i]
+      if (m.role === 'assistant' && m.tool_calls?.length) asstTurn++
+      if (m.role === 'tool' && asstTurn > MAX_AGE) {
+        const brief = (m.content || '').slice(0, 120)
+        if (m.content && m.content.length > 150) {
+          m.content = '[stale r' + asstTurn + '] ' + brief + '…'
+        }
+      }
+    }
+  }
+
+  function fmtLimit(n: number): string {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
+    if (n >= 1000) return (n / 1000).toFixed(0) + 'K'
+    return String(n)
+  }
+
+  /** Format tokens for display. */
+  function fmtTokens(n: number): string {
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K'
+    return String(n)
   }
 
   const suggestedPrompts = [
@@ -457,122 +1000,250 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  /** Switch to a session, loading only the last 50 messages for fast switching. */
+  /**
+   * Parse raw backend messages into display-ready ChatMessage[], preserving
+   * tool_calls, tool_results, reasoning, and interleaving tool-role messages.
+   * Returns merged messages + a reasoning map keyed by final merged index.
+   */
+  function _parseMessages(raw: MemoryMessage[]): { messages: ChatMessage[]; reasoning: Record<number, string> } {
+    // 1. Extract tool-role messages.
+    const toolMsgs: ChatMessage[] = []
+    for (const m of raw) {
+      if (m.role === 'tool' && m.toolJson) {
+        try {
+          const tr = JSON.parse(m.toolJson)
+          toolMsgs.push({ role: 'tool', content: m.content, tool_call_id: tr.tool_call_id, name: tr.name || '' } as any)
+        } catch (_) {}
+      }
+    }
+    // 2. Map user/assistant messages + parse toolJson.
+    const rawReasoning: Record<number, string> = {} // keyed by filtered index
+    const filtered = raw
+      .filter(m => m.role === 'user' || m.role === 'assistant'
+        || (m.role === 'system' && (m.content.includes('📦') || m.content.includes('上下文已截断'))))
+      .map((m, i) => {
+        const msg: ChatMessage = { id: m.id, role: m.role as ChatMessage['role'], content: m.content }
+        if (m.toolJson) {
+          try {
+            const extra = JSON.parse(m.toolJson)
+            if (extra.tool_calls) {
+              msg.tool_calls = extra.tool_calls
+              msg.toolCalls = extra.tool_calls.map((tc: any) => ({ name: tc.function?.name || '' }))
+            }
+            if (extra.tool_results) {
+              msg.toolResults = extra.tool_results
+            }
+            if (extra.reasoning) {
+              rawReasoning[i] = extra.reasoning
+            }
+          } catch (_) {}
+        }
+        return msg
+      })
+    // 3. Interleave tool messages after their assistant messages + back-fill tool results.
+    const merged: ChatMessage[] = []
+    for (const msg of filtered) {
+      if (msg.role === 'assistant' && msg.tool_calls?.length) {
+        const matchedToolMsgs: ChatMessage[] = []
+        for (const tc of msg.tool_calls) {
+          const tm = toolMsgs.find(t => t.tool_call_id === tc.id)
+          if (tm) matchedToolMsgs.push(tm)
+        }
+        const displayToolResults: any[] = (msg.toolResults || []).slice()
+        if (!displayToolResults.length && matchedToolMsgs.length) {
+          for (const tm of matchedToolMsgs) {
+            try {
+              const r = JSON.parse(tm.content || '{}')
+              displayToolResults.push({ name: (tm as any).name || '', args: {}, result: r })
+            } catch (_) {
+              displayToolResults.push({ name: (tm as any).name || '', args: {}, result: { success: false, error: '(解析失败)' } })
+            }
+          }
+        }
+        if (displayToolResults.length < msg.tool_calls.length) {
+          for (let j = displayToolResults.length; j < msg.tool_calls.length; j++) {
+            displayToolResults.push({
+              name: msg.tool_calls[j].function?.name || '',
+              args: {},
+              result: { success: false, error: '(结果丢失)' },
+            })
+          }
+        }
+        msg.toolResults = displayToolResults
+        merged.push(msg)
+        merged.push(...matchedToolMsgs)
+      } else {
+        merged.push(msg)
+      }
+    }
+    // 4. Remap reasoning from filtered indices to merged indices.
+    const reasoning: Record<number, string> = {}
+    if (Object.keys(rawReasoning).length) {
+      let fi = 0
+      for (let mi = 0; mi < merged.length; mi++) {
+        const m = merged[mi]
+        if (m.role === 'user' || m.role === 'assistant') {
+          if (rawReasoning[fi]) reasoning[mi] = rawReasoning[fi]
+          fi++
+        }
+      }
+    }
+    return { messages: merged, reasoning }
+  }
+
+  /** Switch to a session, loading only the last PAGE_SIZE messages for fast switching. */
   async function selectSession(id: string) {
     if (currentSessionId.value === id && messages.value.length) return
     currentSessionId.value = id
     expandedTool.value = {}
     hasMoreMessages.value = false
     totalMessageCount.value = 0
+    compressionMarker.value = -1
+    _olderBuffer = []
+    _olderReasoning = {}
     loadMessageFiles()
     try {
-      // Load only the most recent 50 messages. Full history loads on demand.
-      const PAGE_SIZE = 50
+      const PAGE_SIZE = 100
       const [msgs, total] = await Promise.all([
         memoryApi.messageListRecent(id, PAGE_SIZE),
         memoryApi.messageCount(id),
       ])
       totalMessageCount.value = total
-      // Restore tool results as separate tool messages so the API is happy.
-      const toolMsgs: ChatMessage[] = []
-      for (const m of (msgs || [])) {
-        if (m.role === 'tool' && m.toolJson) {
-          try {
-            const tr = JSON.parse(m.toolJson)
-            toolMsgs.push({ role: 'tool', content: m.content, tool_call_id: tr.tool_call_id, name: tr.name || '' } as any)
-          } catch (_) {}
+      const parsed = _parseMessages(msgs || [])
+      messages.value = parsed.messages
+      reasoningContent.value = parsed.reasoning
+      // Restore compression marker: find the last compression/truncation divider.
+      for (let i = messages.value.length - 1; i >= 0; i--) {
+        const c = messages.value[i].content || ''
+        if (c.includes('📦 上下文压缩') || c.includes('上下文已截断')) {
+          compressionMarker.value = i
+          break
         }
       }
-      const filtered = (msgs || [])
-        .filter(m => m.role === 'user' || m.role === 'assistant')
-        .map((m, i) => {
-          const msg: ChatMessage = { role: m.role as ChatMessage['role'], content: m.content }
-          if (m.toolJson) {
-            try {
-              const extra = JSON.parse(m.toolJson)
-              if (extra.tool_calls) {
-                msg.tool_calls = extra.tool_calls
-                msg.toolCalls = extra.tool_calls.map((tc: any) => ({ name: tc.function?.name || '' }))
-              }
-              if (extra.tool_results) {
-                msg.toolResults = extra.tool_results
-              }
-              if (extra.reasoning) {
-                reasoningContent.value[i] = extra.reasoning
-              }
-            } catch (_) {}
-          }
-          return msg
-        })
-      // Interleave tool messages after their corresponding assistant messages.
-      // If any tool_call lacks a matching tool message, strip the tool_calls
-      // entirely so the API doesn't see a dangling tool_calls without results.
-      const merged: ChatMessage[] = []
-      for (const msg of filtered) {
-        if (msg.role === 'assistant' && msg.tool_calls?.length) {
-          const matchedToolCalls: any[] = []
-          const matchedToolMsgs: ChatMessage[] = []
-          for (const tc of msg.tool_calls) {
-            const tm = toolMsgs.find(t => t.tool_call_id === tc.id)
-            if (tm) {
-              matchedToolCalls.push(tc)
-              matchedToolMsgs.push(tm)
-            }
-          }
-          // Always include the message with its tool calls visible.
-          // If tool_results were not persisted (pre-existing data before the
-          // toolResults feature), reconstruct them from the matching tool
-          // messages so the terminal widget doesn't show "executing…" forever.
-          const displayToolResults: any[] = (msg.toolResults || []).slice()
-          if (!displayToolResults.length && matchedToolMsgs.length) {
-            for (const tm of matchedToolMsgs) {
-              try {
-                const r = JSON.parse(tm.content || '{}')
-                displayToolResults.push({ name: (tm as any).name || '', args: {}, result: r })
-              } catch (_) {
-                displayToolResults.push({ name: (tm as any).name || '', args: {}, result: { success: false, error: '(解析失败)' } })
-              }
-            }
-          }
-          // Back-fill missing slots so every tool_call has a toolResults entry.
-          if (displayToolResults.length < msg.tool_calls.length) {
-            for (let j = displayToolResults.length; j < msg.tool_calls.length; j++) {
-              displayToolResults.push({
-                name: msg.tool_calls[j].function?.name || '',
-                args: {},
-                result: { success: false, error: '(结果丢失)' },
-              })
-            }
-          }
-          msg.toolResults = displayToolResults
-          merged.push(msg)
-          merged.push(...matchedToolMsgs)
-        } else {
-          merged.push(msg)
-        }
-      }
-      messages.value = merged
       // If the DB has more messages than we loaded, mark for lazy-load.
       hasMoreMessages.value = total > PAGE_SIZE
+      // Estimate static token costs for the breakdown display.
+      await _estimateStaticCounters()
+      // Auto-compress if context is dangerously high after loading.
+      if (contextPct.value >= 80) {
+        console.warn('[context] session loaded at ' + contextPct.value + '% — auto-compressing')
+        await _forceCompress()
+      }
     } catch (_) {
       messages.value = []
     }
   }
 
-  /** Load earlier (older) messages for the current session. */
+  /** Rough estimate of system/tool/memory tokens for display when not in active chat. */
+  async function _estimateStaticCounters() {
+    try {
+      const go = window.go.app.App
+      // Estimate system prompt from enabled skills.
+      let sysPrompt = '你是 EverEvo 桌面软件的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程\n1. 分析 → 2. 行动 → 3. 观察 → 4. 重复 → 5. 最终回答\n\n## 工具规则\n- 先思考再行动，失败换方案\n- JSON 提取关键字段，不要整套贴出\n- 不需要工具就直接回答\n\n## 其他\n- 用户说中文用中文回复'
+      const enabledSkills = await go.ListEnabledSkills(activeLibraryId.value).catch(() => [])
+      for (const s of (enabledSkills || [])) {
+        if (s.systemPrompt) sysPrompt += '\n【' + (s.title || '') + '】' + s.systemPrompt
+      }
+      _sysPromptTokens.value = estimateTokens(sysPrompt)
+
+      // Estimate tool definitions.
+      const toolNames = await go.GetEnabledToolNames().catch(() => [])
+      const allTools = await go.ListTools().catch(() => [])
+      const enabledTools = (allTools || []).filter((t: any) => toolNames.includes(t.name))
+      _toolDefTokens.value = (enabledTools as any[]).reduce((sum: number, t: any) => {
+        const fullDef = {
+          type: 'function',
+          function: { name: t.name, description: t.description || '', parameters: t.rawParameters || t.parameters || {} }
+        }
+        return sum + estimateTokens(JSON.stringify(fullDef))
+      }, 0)
+
+      _memRagTokens.value = 0 // no active recall during session load
+    } catch (_) {
+      // Conservative fallback
+      _sysPromptTokens.value = 4000
+      _toolDefTokens.value = 5000
+      _memRagTokens.value = 0
+    }
+  }
+
+  // Buffer of older messages yet to be prepended (client-side pagination).
+  let _olderBuffer: ChatMessage[] = []
+  // Reasoning content for buffered messages (merged-index → text), pending prepend.
+  let _olderReasoning: Record<number, string> = {}
+
+  /** Generate a temporary ID for newly-created messages (before backend persist). */
+  function _tempId(): string { return 'm_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8) }
+
+  /** Load earlier (older) messages for the current session — batched, 50 per pull. */
   async function loadEarlierMessages() {
     const sid = currentSessionId.value
-    if (!sid || !hasMoreMessages.value) return
-    const PAGE_SIZE = 50
+    if (!sid || !hasMoreMessages.value || _loadingMore) return
+    _loadingMore = true
     try {
-      const all = await memoryApi.messageList(sid) || []
-      const filtered = all
-        .filter(m => m.role === 'user' || m.role === 'assistant')
-        .map(m => ({ role: m.role as ChatMessage['role'], content: m.content }))
-      messages.value = filtered
-      hasMoreMessages.value = false
-    } catch (_) { /* keep current messages */ }
+      // If buffer is empty, fetch all messages from backend and parse them fully
+      // (tool calls, results, reasoning, interleaved tool messages).
+      if (!_olderBuffer.length) {
+        const all = await memoryApi.messageList(sid) || []
+        const existingIds = new Set(messages.value.map(m => m.id).filter(Boolean))
+        const olderRaw = all.filter(m => !existingIds.has(m.id))
+        if (!olderRaw.length) { hasMoreMessages.value = false; _loadingMore = false; return }
+        const parsed = _parseMessages(olderRaw)
+        _olderBuffer = parsed.messages
+        _olderReasoning = parsed.reasoning
+      }
+      if (!_olderBuffer.length) { hasMoreMessages.value = false; _loadingMore = false; return }
+
+      // Take a batch from the end of the buffer (closest to currently-visible messages).
+      const BATCH = 50
+      const batch = _olderBuffer.slice(-BATCH)
+      _olderBuffer = _olderBuffer.slice(0, -BATCH)
+      // Split reasoning: entries in the batch (indices 0..batchLen-1) vs. remaining.
+      const remainingStart = _olderBuffer.length
+      const batchReasoning: Record<number, string> = {}
+      const nextReasoning: Record<number, string> = {}
+      for (const [k, v] of Object.entries(_olderReasoning)) {
+        const ki = Number(k)
+        if (ki >= remainingStart) {
+          batchReasoning[ki - remainingStart] = v
+        } else {
+          nextReasoning[ki] = v
+        }
+      }
+      _olderReasoning = nextReasoning
+
+      hasMoreMessages.value = _olderBuffer.length > 0 || Object.keys(_olderReasoning).length > 0
+
+      // Scroll anchor: capture scrollHeight before DOM mutation.
+      const el = _chatBoxRef
+      const prevScrollHeight = el?.scrollHeight || 0
+      const prevScrollTop = el?.scrollTop || 0
+
+      // Prepend batch + shift existing reasoningContent.
+      const shift = batch.length
+      const newReasoning: Record<number, string> = {}
+      for (const [k, v] of Object.entries(batchReasoning)) newReasoning[Number(k)] = v
+      for (const [k, v] of Object.entries(reasoningContent.value)) newReasoning[Number(k) + shift] = v
+      reasoningContent.value = newReasoning
+
+      messages.value = [...batch, ...messages.value]
+
+      // Restore scroll before the browser paints so the transition is seamless.
+      await nextTick()
+      if (el) {
+        await new Promise<void>(resolve => {
+          requestAnimationFrame(() => {
+            el.scrollTop = prevScrollTop + (el.scrollHeight - prevScrollHeight)
+            resolve()
+          })
+        })
+      }
+      _loadingMore = false
+    } catch (_) { _loadingMore = false; _olderBuffer = []; _olderReasoning = {} }
   }
+
+  /** Set the chat box element ref for scroll position restore on load-more. */
+  function setChatBoxRef(el: any) { _chatBoxRef = el }
 
   /** Rename a session (title). */
   async function renameSession(id: string, title: string) {
@@ -729,7 +1400,7 @@ export const useChatStore = defineStore('chat', () => {
     const msgIdx = messages.value.length
     attachFilesToMessage(msgIdx)
     pendingFiles.value = []
-    messages.value.push({ role: 'user', content: displayText })
+    messages.value.push({ id: _tempId(), role: 'user', content: displayText })
     await persist('user', displayText)
     busy.value = true
 
@@ -738,7 +1409,7 @@ export const useChatStore = defineStore('chat', () => {
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
       console.error('[chat] chatLoop error:', msg)
-      messages.value.push({ role: 'assistant', content: '❗ 错误: ' + msg })
+      messages.value.push({ id: _tempId(), role: 'assistant', content: '❗ 错误: ' + msg })
     }
     busy.value = false
   }
@@ -763,11 +1434,11 @@ export const useChatStore = defineStore('chat', () => {
         systemContent = ctx.systemPrompt
         tools = (ctx.tools || []) as ToolDef[]
         const ag = agents.value.find(a => a.id === selId)
-        // Inject thinking instruction when thinkMode is on.
-        if (thinkMode.value) {
-          const effortHint = thinkEffort.value === 'max' ? 'Think deeply and exhaustively before answering.' : 'Think briefly before answering.'
-          systemContent += '\n\nYou MUST think before answering. Use internal reasoning in English to plan your approach, then respond to the user in Chinese. ' + effortHint
+        // Prepend ReAct framework if the agent prompt doesn't already include it.
+        if (!systemContent.includes('ReAct') && !systemContent.includes('推理-行动')) {
+          systemContent = '你是 EverEvo 的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程\n1. 分析需求 → 2. 调用工具 → 3. 观察结果 → 4. 重复直至完成 → 5. 最终回答（简洁中文，不照搬 JSON）\n\n## 工具规则\n- 先思考再行动，失败换方案\n- JSON 提取关键字段，不要整套贴出\n- 不需要工具就直接回答\n\n---\n\n' + systemContent
         }
+        // Think mode instruction is injected in the shared block below.
         agentStream = {
           providerId: ctx.providerId || '',
           model: ctx.model || '',
@@ -775,7 +1446,7 @@ export const useChatStore = defineStore('chat', () => {
           maxTokens: ag?.maxTokens || 0,
         }
       } catch (e: unknown) {
-        messages.value.push({ role: 'assistant', content: '❗ 加载 Agent 失败: ' + errMsg(e) })
+        messages.value.push({ id: _tempId(), role: 'assistant', content: '❗ 加载 Agent 失败: ' + errMsg(e) })
         return
       }
       // P10: Append domain context even when using a specific agent.
@@ -798,6 +1469,7 @@ export const useChatStore = defineStore('chat', () => {
 
       if (!tools.length) {
         messages.value.push({
+          id: _tempId(),
           role: 'assistant',
           content: '⚠ 没有启用的工具。请先在「能力清单」中启用至少一个 Skill，或连接外部 MCP Server。',
         })
@@ -808,7 +1480,25 @@ export const useChatStore = defineStore('chat', () => {
       let enabledSkills: SkillInfo[]
       try { enabledSkills = (await go.ListEnabledSkills(activeLibraryId.value)) || [] } catch (_) { enabledSkills = [] }
 
-      const basePrompt = '你是 EverEvo 桌面软件的 AI 助手。用户说中文，用中文回复。当需要执行操作时使用工具调用。每次回复尽量简洁。\n\n用户可能通过拖拽或粘贴上传文件到对话中。对于文本文件（TXT、MD、CSV、JSON 等），内容会自动注入。对于 PDF 和图片文件，请使用 read_file 或 read_media_file 工具读取。对于扫描件 PDF（isScanned=true），请使用 read_media_file 工具以图片形式查看页面。'
+      const basePrompt = `你是 EverEvo 桌面软件的 AI 助手，遵循 ReAct（推理-行动）框架工作。
+
+## 工作流程 (ReAct Framework)
+1. **分析 (Thought)**: 理解用户意图，判断需要什么信息、调用哪些工具。
+2. **行动 (Action)**: 选择合适的工具，用精确的参数调用。不确定时先想清楚再调。
+3. **观察 (Observation)**: 仔细阅读工具返回结果。成功？失败？有什么关键信息？
+4. **重复 1-3** 直到掌握足够信息，然后给出最终答案。
+5. **最终回答 (Final Answer)**: 用简洁中文直接回复用户，不要照搬工具输出的原始 JSON。
+
+## 工具使用规则
+- 思考再行动：永远先想清楚需要什么工具、传什么参数，不要盲调。
+- 工具失败时分析错误原因，尝试替代方案（换个工具、换个参数）。
+- 工具结果如果是 JSON，提取关键字段后再回复，不要整套 JSON 贴出来。
+- 如果不需要工具就能回答，直接回答即可（零工具调用）。
+
+## 其他规则
+- 用户说中文，用中文回复。每次回复尽量简洁直接。
+- 用户可通过拖拽或粘贴上传文件。文本文件（TXT/MD/CSV/JSON 等）内容会自动注入。PDF 和图片请用 read_file 或 read_media_file 工具读取。扫描件 PDF (isScanned=true) 请用 read_media_file 以图片形式查看。`
+
       const skillPrompts = enabledSkills
         .filter(s => s.systemPrompt)
         .map(s => `【${s.title}】${s.systemPrompt}`)
@@ -911,8 +1601,42 @@ export const useChatStore = defineStore('chat', () => {
 
     const apiMsgs: APIMessage[] = normalizeToolMessages([
       { role: 'system', content: systemContent },
-      ...messages.value.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool'),
+      // Only send messages after the compression marker (logical truncation).
+      // Full history is preserved in messages.value for UI scrolling.
+      ...apiMessages.value.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool'),
     ])
+
+    // Cache token estimates for the fixed-cost components (used by contextTokens).
+    _sysPromptTokens.value = estimateTokens(systemContent)
+    // Count the FULL JSON payload (type + function wrapper) that goes in the API request.
+    _toolDefTokens.value = tools.reduce((sum, t) => {
+      const fullDef = {
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description || '',
+          parameters: t.rawParameters || t.parameters || {},
+        },
+      }
+      return sum + estimateTokens(JSON.stringify(fullDef))
+    }, 0)
+    if (tools.length > 30) {
+      console.warn('[context] ' + tools.length + ' tools enabled — research shows >30 degrades agent performance. Consider disabling unused skills.')
+    }
+    // Memory/RAG is embedded in systemContent; we estimate it separately for the breakdown.
+    // The recall/RAG injection happens above; its token count is the difference between
+    // the full systemContent and the base prompt (before memory injection).
+    // A simpler approach: re-estimate just the memory-related portions.
+    _memRagTokens.value = 0
+    // Roughly: if memory/recall/RAG blocks were injected, count them.
+    const memMarker = '长期记忆（与当前问题相关的过往信息'
+    const ragMarker = '知识库检索结果'
+    const wikiMarker = '项目文档'
+    for (const line of systemContent.split('\n')) {
+      if (line.includes(memMarker) || line.includes(ragMarker) || line.includes(wikiMarker)) {
+        _memRagTokens.value += estimateTokens(line)
+      }
+    }
 
     // No round cap (requested): the loop runs until the model returns a final
     // answer (no more tool calls) or the user stops it. No iteration /
@@ -923,12 +1647,27 @@ export const useChatStore = defineStore('chat', () => {
     for (;;) {
       if (stopRequested.value) { busy.value = false; currentStreamId.value = ''; return }
       round++
-      // MemGPT-style: emergency compression mid-loop (multi-turn spillover).
-      if (contextPct.value > 50 && round > 5 && round % 3 === 0) {
-        await maybeCompressContext()
+      // ── Stale tool result pruning (save context space) ──
+      _pruneOldToolResults(round)
+      // ── Staged context management between rounds (MemGPT + CoMem hybrid) ──
+      // force=true bypasses the busy guard (we ARE busy, but between API calls).
+      const pct = contextPct.value
+      if (pct >= 50 && round > 5) {
+        // Frequency adapts to urgency:
+        //   50-65%  → every 5 rounds (gentle pre-compute)
+        //   65-80%  → every 3 rounds (soft warning + pre-compute)
+        //   80-90%  → every 2 rounds (apply compression)
+        //   90%+    → every round (truncation guard)
+        const freq = pct >= 90 ? 1 : pct >= 80 ? 2 : pct >= 65 ? 3 : 5
+        if (round % freq === 0) {
+          await maybeCompressContext(true)
+        }
       }
+      // Hard guard: if still over the absolute model limit, truncate.
+      _truncateForLimit()
       const msgIdx = messages.value.length
-      messages.value.push({ role: 'assistant', content: '' })
+      const asstId = _tempId()
+      messages.value.push({ id: asstId, role: 'assistant', content: '' })
 
       try {
         const streamId = 's' + Date.now() + '_' + Math.random().toString(36).slice(2)
@@ -974,6 +1713,10 @@ export const useChatStore = defineStore('chat', () => {
             },
           }))
           const effort = thinkMode.value ? thinkEffort.value : ''
+          // ── Pre-request context safety check ──
+          // If context exceeds 90% of the model's absolute limit, hard-truncate
+          // the oldest messages so the request doesn't fail.
+          _truncateForLimit()
           // Normalize before every send: guarantee every assistant.tool_calls
           // is followed by a matching tool result (DeepSeek/OpenAI reject
           // dangling tool_calls with HTTP 400). Cheap defensive copy per turn.
@@ -981,7 +1724,12 @@ export const useChatStore = defineStore('chat', () => {
           if (agentStream) {
             agentsApi.streamAs(streamId, sendMsgs, toolPayload, agentStream.providerId, agentStream.model, agentStream.temperature, agentStream.maxTokens, effort).catch(reject)
           } else {
-            go.ChatStream(streamId, sendMsgs, toolPayload, effort).catch(reject)
+            // Default path: use ChatStreamAs with dynamic max_tokens based on available budget.
+            const defP = activeProvider.value
+            const maxOut = Math.min(16384, Math.max(4096,
+              contextLimit.value - contextTokens.value - 2000))
+            go.ChatStreamAs(streamId, sendMsgs, toolPayload,
+              defP?.id || '', defP?.model || '', -1, maxOut, effort).catch(reject)
           }
         })
 
@@ -997,8 +1745,9 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         const msg = resp.choices[0].message
-        // Replace placeholder with full message (preserve tool_calls)
+        // Replace placeholder with full message (preserve id + tool_calls)
         messages.value[msgIdx] = {
+          id: asstId,
           role: 'assistant',
           content: msg.content || '',
           tool_calls: msg.tool_calls || undefined,
@@ -1011,11 +1760,11 @@ export const useChatStore = defineStore('chat', () => {
         if (reasoningContent.value[msgIdx]) extra.reasoning = reasoningContent.value[msgIdx]
         const toolJSON = Object.keys(extra).length ? JSON.stringify(extra) : ''
         const persistedId = await persist('assistant', msg.content || '', toolJSON)
+        // Log context growth per round for diagnostics.
+        _logContextGrowth(round)
         // Auto-title: rename "新对话" sessions after enough rounds.
         // Best-effort; failures are silent inside the backend goroutine.
         memoryApi.sessionAutoTitle(currentSessionId.value)
-        // Auto-compress context when approaching the model's limit.
-        maybeCompressContext()
         // P1.5: remember the final answer (not tool-only rounds) for future recall.
         if (!msg.tool_calls?.length && msg.content) {
           const u = lastUserContent()
@@ -1058,19 +1807,41 @@ export const useChatStore = defineStore('chat', () => {
                 ])
               } catch (e: unknown) {
                 const msg = e instanceof Error ? e.message : String(e)
-                result = { success: false, error: msg }
-                // The backend is still running — when it finishes, replace the
-                // timeout error with the real result so the conversation (and
-                // the terminal widget) can see it in later rounds.
+                // ── Convert timeout to async background task ──
+                const asyncStore = useAsyncStore()
+                const go2 = (window as any).go?.app?.App
+                const isTimeout = msg.includes('超时') || msg.includes('timeout')
+                if (isTimeout && go2?.CreateAsyncTask && currentSessionId.value) {
+                  const title = tc.function.name + ' - ' + JSON.stringify(args).slice(0, 80)
+                  try {
+                    const ctx = JSON.stringify({ messages: messages.value.slice(-40) })
+                    const at = await go2.CreateAsyncTask(currentSessionId.value, title, tc.function.name, JSON.stringify(args), ctx)
+                    go2.RunAsyncTool(at.id, tc.function.name, args)  // fire-and-forget
+                    result = {
+                      success: true,
+                      data: { asyncTaskId: at.id, message: '已移至后台执行 (async:' + at.id.slice(0, 8) + ')，完成后可恢复对话' },
+                    }
+                  } catch (_) {
+                    result = { success: false, error: msg }
+                  }
+                } else {
+                  result = { success: false, error: msg }
+                }
+                // Late-result patching: backend promise continues, update when done.
                 const toolCallId = tc.id
                 callPromise.then((late) => {
-                  // Update terminal display (tool result block)
                   if (idx < messages.value[msgIdx].toolResults!.length) {
                     messages.value[msgIdx].toolResults![idx].result = late
                     messages.value[msgIdx] = { ...messages.value[msgIdx] }
                   }
-                  // Swap the "超时" tool message for the real result so the LLM
-                  // can consume it in the next round.
+                  // Complete async task if one was created
+                  if ((result as any)?.data?.asyncTaskId && late?.success) {
+                    const rid = JSON.stringify(late.data || late)
+                    go2?.CompleteAsyncTask?.((result as any).data.asyncTaskId, rid).catch(() => {})
+                  }
+                  if ((result as any)?.data?.asyncTaskId && !late?.success) {
+                    go2?.FailAsyncTask?.((result as any).data.asyncTaskId, late?.error || 'unknown').catch(() => {})
+                  }
                   for (let k = messages.value.length - 1; k >= 0; k--) {
                     const mk = messages.value[k]
                     if (mk.role === 'tool' && mk.tool_call_id === toolCallId && (mk.content || '').includes('超时')) {
@@ -1087,12 +1858,31 @@ export const useChatStore = defineStore('chat', () => {
               messages.value[msgIdx].toolResults![idx].result = result
               messages.value[msgIdx] = { ...messages.value[msgIdx] }
             }
-            const toolMsg = { role: 'tool' as const, tool_call_id: tc.id, content: JSON.stringify(result) }
+            // Truncate oversized tool results: keep the result object FULL for the
+            // terminal widget (UI), but send a truncated version to the API.
+            // Strategy: drop verbose `data` field, keep head+tail if still too large.
+            const MAX_RESULT = 3000
+            const HEAD = 2000
+            const TAIL = 800
+            let apiResultStr = JSON.stringify(result)
+            if (apiResultStr.length > MAX_RESULT) {
+              // Try dropping the data field (usually the bulk of web_fetch/read_file).
+              if (result.data) {
+                const slim = { ...result, data: '[已截断，原始长度 ' + JSON.stringify(result.data).length + ' 字符]' }
+                apiResultStr = JSON.stringify(slim)
+              }
+              if (apiResultStr.length > MAX_RESULT) {
+                apiResultStr = apiResultStr.slice(0, HEAD) +
+                  '…[截断 ' + (apiResultStr.length - HEAD - TAIL) + ' 字符]…' +
+                  apiResultStr.slice(-TAIL)
+              }
+            }
+            const toolMsg = { role: 'tool' as const, tool_call_id: tc.id, content: apiResultStr }
             apiMsgs.push(toolMsg)
             messages.value.push(toolMsg)
-            // Persist tool result as a tool message so it can be restored.
+            // Persist truncated tool result.
             const toolJson = JSON.stringify({ tool_call_id: tc.id, name: tc.function.name, args })
-            memoryApi.messageAppend(currentSessionId.value, 'tool', JSON.stringify(result), toolJson).catch(() => {})
+            memoryApi.messageAppend(currentSessionId.value, 'tool', apiResultStr, toolJson).catch(() => {})
           }
           // Update assistant message with tool execution results.
           // Backend uses JSON merge (not replace), so reasoning from the
@@ -1102,6 +1892,11 @@ export const useChatStore = defineStore('chat', () => {
               tool_results: messages.value[msgIdx].toolResults!.map(tr => ({
                 name: tr.name, args: tr.args, result: tr.result,
               })),
+            }
+            // Preserve reasoning from the earlier persist (messageUpdateToolJSON replaces the
+            // whole tool_json column — we must re-include reasoning or it will be lost).
+            if (reasoningContent.value[msgIdx]) {
+              updated.reasoning = reasoningContent.value[msgIdx]
             }
             memoryApi.messageUpdateToolJSON(persistedId, JSON.stringify(updated)).catch(() => {})
           }
@@ -1125,8 +1920,9 @@ export const useChatStore = defineStore('chat', () => {
   return {
     // state
     messages, inputText, busy, expandedTool, providers, activeId, skills, agents, selectedAgentId,
-    sessions, currentSessionId, pendingFiles, messageFiles, hasMoreMessages, totalMessageCount, thinkMode, thinkEffort, stopRequested, currentStreamId, reasoningContent, compressedAt,
-    contextTokens, contextTarget, contextLimit, contextPct, contextLevel,
+    sessions, currentSessionId, pendingFiles, messageFiles, hasMoreMessages, totalMessageCount, thinkMode, thinkEffort, stopRequested, currentStreamId, reasoningContent, compressedAt, compressionMarker, showCompressedHistory, historyVisibleCount, historyMessages, historyRoundCount, apiMessages, revealMoreHistory, hideCompressedHistory,
+    contextTokens, contextTarget, contextLimit, contextUsable, contextReserved,
+    contextPct, contextBarPct, contextLimitPct, contextLevel, contextBreakdown,
     // getters
     activeProvider, chatReady, suggestedPrompts, selectedAgentName, visibleAgents, activeLibraryId,
     // helpers
@@ -1135,7 +1931,7 @@ export const useChatStore = defineStore('chat', () => {
     loadConfig, loadSkills, loadAgents, selectAgent, clearMessages, sendMessage, toggleToolResult,
     loadSessions, createSession, selectSession, renameSession, deleteSession,
     addFile, removeFile, clearFiles,
-    loadEarlierMessages,
+    loadEarlierMessages, setChatBoxRef,
     maybeCompressContext,
   }
 })

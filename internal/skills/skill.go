@@ -77,9 +77,9 @@ var builtinSkills = []Skill{
 		Name: "system-monitor", Title: "系统信息", Icon: "◎",
 		Description: "查看系统和硬件信息：CPU/GPU/内存状态、推理后端可用性、应用配置",
 		Category:    "system", Package: "everevo", Enabled: true,
-		Tools:     []string{"system_info", "system_dynamic", "system_backends", "system_config", "proxy_get", "proxy_set", "proxy_test", "proxy_toggle", "download_engine", "shell_exec"},
+		Tools:     []string{"system_info", "system_dynamic", "system_backends", "system_config", "proxy_get", "proxy_set", "proxy_test", "proxy_toggle", "download_engine", "shell_exec", "web_search", "web_fetch"},
 		Resources: []string{"everevo://system/info", "everevo://system/dynamic", "everevo://system/backends"},
-		SystemPrompt: "你是系统监控专家。帮助用户查看硬件状态、推理引擎可用性和应用配置。当用户遇到性能问题时，分析系统资源瓶颈。你可以使用 shell_exec 执行命令来检查文件、git 状态、npm/pip 操作等，就像在终端操作一样。",
+		SystemPrompt: "你是系统监控专家。帮助用户查看硬件状态、推理引擎可用性和应用配置。当用户遇到性能问题时，分析系统资源瓶颈。你可以使用 shell_exec 执行命令来检查文件、git 状态、npm/pip 操作等，就像在终端操作一样（也支持 playwright-cli 浏览器自动化）。使用 web_search 搜索互联网信息，web_fetch 抓取网页内容。",
 	},
 	{
 		Name: "model-toolbox", Title: "工具箱", Icon: "⊞",
@@ -124,15 +124,8 @@ var builtinSkills = []Skill{
 		Name: "agent-orchestration", Title: "智能体编排", Icon: "◉",
 		Description: "管理本地 Agent（智能体人格）：列出、按需创建专门角色、把子任务委派给指定 Agent 执行",
 		Category:    "agent", Package: "everevo", Enabled: true,
-		Tools:     []string{"agent_list", "agent_create", "agent_set_library", "agent_run", "agent_delegate_to_domain", "agent_delegate_multi_domain", "agent_synthesize_tool", "memory_list", "memory_search", "memory_delete", "memory_add_fact", "memory_clear", "core_list", "core_add", "core_delete", "session_list", "session_delete", "graph_list", "graph_add_edge", "graph_delete_node", "graph_rename_node", "graph_migrate", "graph_rebuild_from_domain", "experience_list", "experience_delete", "library_list", "library_create", "library_delete"},
-		SystemPrompt: "你是智能体编排中枢。当遇到需要专门角色的子任务（如翻译、代码审查、数据分析等），先用 agent_list 查看可用 Agent，再用 agent_run 委派；若没有合适的 Agent，可用 agent_create 按需创建一个（需提供名称、用途和完整系统提示词）。委派后把子 Agent 的回复整合给用户，不要原样转述其内部思考。",
-		},
-		{
-			Name: "playwright-browser", Title: "浏览器自动化", Icon: "🌐",
-			Description: "通过 Playwright CLI 控制浏览器：打开网页、填写表单、截图、测试",
-			Category: "browser", Package: "everevo", Enabled: true,
-			Tools: []string{"shell_exec"},
-			SystemPrompt: "你是浏览器自动化专家。使用 shell_exec 调用 playwright-cli 控制浏览器。安装: npm install -g @playwright/cli",
+		Tools:     []string{"agent_list", "agent_create", "agent_set_library", "agent_run", "agent_delegate_to_domain", "agent_delegate_multi_domain", "agent_synthesize_tool", "memory_list", "memory_search", "memory_delete", "memory_add_fact", "memory_clear", "core_list", "core_add", "core_delete", "session_list", "session_delete", "graph_list", "graph_add_edge", "graph_delete_node", "graph_rename_node", "graph_migrate", "graph_rebuild_from_domain", "experience_list", "experience_delete", "library_list", "library_create", "library_delete", "a2a_list_agents", "a2a_connect_agent", "a2a_disconnect_agent", "a2a_send_to_agent", "a2a_agent_status"},
+		SystemPrompt: "你是智能体编排中枢。当遇到需要专门角色的子任务（如翻译、代码审查、数据分析等），先用 agent_list 查看可用 Agent，再用 agent_run 委派；若没有合适的 Agent，可用 agent_create 按需创建一个（需提供名称、用途和完整系统提示词）。也可用 a2a_list_agents 查看远端 Agent，a2a_send_to_agent 向远端派发任务。委派后把子 Agent 的回复整合给用户，不要原样转述其内部思考。",
 		},
 		{
 			Name: "taskboard", Title: "任务板", Icon: "📋",
@@ -177,32 +170,21 @@ var builtinSkills = []Skill{
 			SystemPrompt: "你是知识导入专家。快速导入用 ingest_analyze 预览 → ingest_commit 执行；深度导入用 ingest_deep_analyze 让 LLM 逐文件分析提取结构化元数据 → ingest_deep_commit 执行 → ingest_deep_review 后置审查。大批量高质量导入推荐深度模式。ingest_cancel 可取消进行中的导入。",
 		},
 		{
-			Name: "workspace", Title: "脚本工作区", Icon: "📝",
-			Description: "在规范目录结构中管理脚本和插件",
-			Category: "workspace", Package: "everevo", Enabled: true,
-			Tools:     []string{"shell_exec", "write_file", "list_directory", "read_file"},
-			SystemPrompt: "你是工作区管理员。所有代码文件写入 workspace/ 下，禁止在项目根目录创建文件。脚本: workspace/scripts/<type>_YYYY-MM-DD_name.ext。插件: workspace/plugins/<name>/ 含 README.md。实验: workspace/scratch/。输出: workspace/output/。写完后用 list_directory 确认。",
-		},
-		{
-			Name: "python-scripting", Title: "Python 脚本", Icon: "🐍",
-			Description: "编写和运行 Python 脚本：venv、pip、.py 文件",
+			Name: "scripting", Title: "脚本编程", Icon: "💻",
+			Description: "编写和运行脚本（Python/Node.js/Go/Playwright）：包管理、脚本执行、项目搭建",
 			Category: "scripting", Package: "everevo", Enabled: true,
 			Tools:     []string{"shell_exec", "write_file", "list_directory", "read_file"},
-			SystemPrompt: "你是 Python 脚本专家。代码写在 workspace/ 下。检测环境: python --version。无 venv 时: python -m venv workspace/.venv。Windows 激活: workspace/.venv/Scripts/activate。安装依赖: pip install <pkg>。脚本位置: workspace/scripts/py_YYYY-MM-DD_name.py。首行: #!/usr/bin/env python3。必须有 if __name__ == '__main__': 入口。大项目放 workspace/plugins/<name>/ 含 requirements.txt。运行: python workspace/scripts/py_xxx.py",
-		},
-		{
-			Name: "node-scripting", Title: "Node.js 脚本", Icon: "🟢",
-			Description: "编写和运行 Node.js/TypeScript 脚本：npm、ts-node",
-			Category: "scripting", Package: "everevo", Enabled: true,
-			Tools:     []string{"shell_exec", "write_file", "list_directory", "read_file"},
-			SystemPrompt: "你是 Node.js 脚本专家。代码写在 workspace/ 下。检测: node --version && npm --version。初始化: npm init -y (在 workspace/ 下)。装包: npm install <pkg>。TypeScript: npm install -D typescript ts-node @types/node。JS 脚本: workspace/scripts/js_YYYY-MM-DD_name.js。TS 脚本: workspace/scripts/ts_YYYY-MM-DD_name.ts。输出: console.log()。大项目: workspace/plugins/<name>/ 含 package.json。运行 JS: node workspace/scripts/js_xxx.js。运行 TS: npx ts-node workspace/scripts/ts_xxx.ts",
-		},
-		{
-			Name: "go-scripting", Title: "Go 脚本", Icon: "🔵",
-			Description: "编写和运行 Go 脚本/工具：go run、go mod init、go build",
-			Category: "scripting", Package: "everevo", Enabled: true,
-			Tools:     []string{"shell_exec", "write_file", "list_directory", "read_file"},
-			SystemPrompt: "你是 Go 脚本专家。代码写在 workspace/ 下。检测: go version。简单脚本可 go run（项目 go.mod 下）。独立工具: go mod init workspace-plugin。脚本: workspace/scripts/go_YYYY-MM-DD_name.go。独立工具: workspace/plugins/<name>/ 下 go mod init + main.go。可 import everevo/internal/xxx。输出: fmt.Println()。单文件运行: go run workspace/scripts/go_xxx.go。独立运行: cd workspace/plugins/<name> && go run .。编译: go build -o workspace/output/xxx.exe",
+			SystemPrompt: `你是多语言脚本专家。代码写在 workspace/ 下，禁止在项目根目录创建文件。
+
+Python: python --version → python -m venv workspace/.venv → 激活 workspace/.venv/Scripts/activate → pip install <pkg>。脚本: workspace/scripts/py_YYYY-MM-DD_name.py，首行 #!/usr/bin/env python3，必须有 if __name__ == '__main__':。
+
+Node.js: node --version && npm --version → npm init -y → npm install <pkg>。JS: workspace/scripts/js_YYYY-MM-DD_name.js。TS: workspace/scripts/ts_YYYY-MM-DD_name.ts，需 npm install -D typescript ts-node @types/node。
+
+Go: go version → go run workspace/scripts/go_YYYY-MM-DD_name.go。独立工具: workspace/plugins/<name>/ 下 go mod init + main.go，可 import everevo/internal/xxx。
+
+Playwright: npm install -g @playwright/cli，然后用 shell_exec 调用 playwright-cli 控制浏览器。
+
+文件目录: workspace/scripts/, workspace/plugins/<name>/, workspace/scratch/, workspace/output/。写完后用 list_directory 确认。`,
 		},
 }
 

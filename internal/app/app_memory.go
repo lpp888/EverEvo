@@ -652,6 +652,14 @@ func (a *App) GraphRebuildFromDomain(libraryID string) (int, int, error) {
 		entities = append(entities, memory.ExtractedEntity{Name: name, Type: etype})
 	}
 
+		// ── Clear old graph nodes for this domain before rebuild ──
+	log.Printf("[memory] 图谱重建: 清除 %s 领域的旧节点", libraryID)
+	if err := a.memoryStore.DeleteNodesByLibrary(libraryID); err != nil {
+		log.Printf("[memory] 清除旧节点失败 (可能没有): %v", err)
+	} else {
+		log.Printf("[memory] 图谱重建: 已清除 %s 的旧节点", libraryID)
+	}
+
 	// ── Wiki pages as entities ──
 	if pages, pErr := a.WikiListPages(libraryID); pErr == nil {
 		for _, p := range pages {
@@ -682,12 +690,20 @@ func (a *App) GraphRebuildFromDomain(libraryID string) (int, int, error) {
 				Subject: "知识库", Predicate: "包含", Object: kb.Name,
 			})
 			if docs, dErr := ragStore.ListDocuments(kb.ID); dErr == nil {
-				for _, d := range docs {
-					name := d.ID
+				for i, d := range docs {
+					// Prefer metadata source, then preview text, then a readable label.
+					name := ""
 					if d.Metadata != nil {
 						if src, ok := d.Metadata["source"]; ok && src != "" {
 							name = src
 						}
+					}
+					if name == "" {
+						name = truncateLabel(d.Preview, 60)
+					}
+					if name == "" {
+						// Never use raw UUID — generate a readable fallback.
+						name = fmt.Sprintf("%s-doc-%d", kb.Name, i+1)
 					}
 					addEntity(name, "document")
 					relations = append(relations, memory.ExtractedRelation{
@@ -926,6 +942,18 @@ func extractTopicTerms(text string) []string {
 		}
 	}
 	return terms
+}
+
+// truncateLabel returns up to maxRunes runes from text, appending "..." if truncated.
+func truncateLabel(text string, maxRunes int) string {
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 // collectContentTerms extracts significant lowercase terms from text content

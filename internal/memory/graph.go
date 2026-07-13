@@ -1,4 +1,4 @@
-package memory
+﻿package memory
 
 import (
 	"database/sql"
@@ -271,6 +271,7 @@ func (s *Store) ListNodesByLibrary(libraryID string) ([]GraphNode, error) {
 		if err := rows.Scan(&n.ID, &n.Type, &n.Name, &n.CreatedAt); err != nil {
 			return nil, err
 		}
+		n.Name = displayNodeName(n.ID, n.Type, n.Name)
 		out = append(out, n)
 	}
 	return out, rows.Err()
@@ -306,6 +307,8 @@ func (s *Store) ListAllEdgesByLibrary(libraryID string) ([]GraphEdge, error) {
 		if err := rows.Scan(&ge.ID, &ge.SrcID, &ge.DstID, &ge.Type, &ge.ValidFrom, &ge.ValidTo, &ge.RecordedAt, &ge.CrossTags, &ge.Weight, &ge.SrcName, &ge.DstName); err != nil {
 			return nil, err
 		}
+		ge.SrcName = displayNodeName(ge.SrcID, "", ge.SrcName)
+		ge.DstName = displayNodeName(ge.DstID, "", ge.DstName)
 		out = append(out, ge)
 	}
 	return out, rows.Err()
@@ -340,6 +343,8 @@ func (s *Store) ListAllEdgesIncludeHistoryByLibrary(libraryID string) ([]GraphEd
 		if err := rows.Scan(&ge.ID, &ge.SrcID, &ge.DstID, &ge.Type, &ge.ValidFrom, &ge.ValidTo, &ge.RecordedAt, &ge.CrossTags, &ge.Weight, &ge.SrcName, &ge.DstName); err != nil {
 			return nil, err
 		}
+		ge.SrcName = displayNodeName(ge.SrcID, "", ge.SrcName)
+		ge.DstName = displayNodeName(ge.DstID, "", ge.DstName)
 		out = append(out, ge)
 	}
 	return out, rows.Err()
@@ -367,6 +372,25 @@ func (s *Store) DeleteNode(id string) error {
 		_ = s.vector.Delete(id) // best-effort orphan cleanup
 	}
 	return nil
+}
+
+// DeleteNodesByLibrary removes all graph nodes and their edges in the
+// given workspace/library. Used before GraphRebuildFromDomain to start fresh.
+func (s *Store) DeleteNodesByLibrary(libraryID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	// Delete edges first, then nodes.
+	if _, err := tx.Exec(`DELETE FROM kg_edges WHERE src_id IN (SELECT id FROM kg_nodes WHERE workspace_id = ?) OR dst_id IN (SELECT id FROM kg_nodes WHERE workspace_id = ?)`, libraryID, libraryID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM kg_nodes WHERE workspace_id = ?`, libraryID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteEdge removes a single edge.
@@ -567,6 +591,37 @@ func (s *Store) ListEdgesForNode(nodeID string, limit int) ([]GraphEdge, error) 
 		out = append(out, ge)
 	}
 	return out, rows.Err()
+}
+
+// displayNodeName returns a human-readable label. If the stored name looks like
+// a UUID or auto-generated ID (e.g., from a KB document chunk with no metadata),
+// it generates a compact display label from the type + short ID suffix.
+func displayNodeName(id, etype, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return shortLabel(id, etype)
+	}
+	// UUID-like: 36 chars, 4 hyphens, hex segments (e.g. "a1b2c3d4-...")
+	if looksLikeUUID(name) {
+		return shortLabel(id, etype)
+	}
+	return name
+}
+
+func looksLikeUUID(s string) bool {
+	return len(s) >= 32 && strings.Count(s, "-") >= 4
+}
+
+func shortLabel(id, etype string) string {
+	tag := etype
+	if tag == "" {
+		tag = "entity"
+	}
+	short := id
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return tag + "-" + short
 }
 
 // FindNodeByName returns the full node row (id, workspace_id) for a normalized

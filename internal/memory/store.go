@@ -322,6 +322,10 @@ func (s *Store) addColumnIfMissing(table, col, def string) error {
 // Close releases the database handle.
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB returns the underlying SQLite connection for subsystems that share the
+// same database (e.g. async task manager).
+func (s *Store) DB() *sql.DB { return s.db }
+
 // ─── Sessions ─────────────────────────────────────────────────────
 
 // CreateSession inserts a new session row.

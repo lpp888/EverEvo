@@ -48,7 +48,7 @@ type Agent struct {
 // BaseSystemPrompt is the default persona prompt for the main agent. It mirrors
 // the chat base prompt (chatStore.ts) so the seeded default agent reproduces the
 // pre-existing chat behavior exactly.
-const BaseSystemPrompt = "你是 EverEvo 桌面软件的 AI 助手。用户说中文，用中文回复。当需要执行操作时使用工具调用。每次回复尽量简洁。\n\n用户可能通过拖拽或粘贴上传文件到对话中。对于文本文件（TXT、MD、CSV、JSON 等），内容会自动注入。对于 PDF 和图片文件，请使用 read_file 或 read_media_file 工具读取。对于扫描件 PDF（isScanned=true），请使用 read_media_file 工具以图片形式查看页面。\n\n【任务规划】面对多步骤的复杂任务，先用 plan_create 把任务拆解成有序步骤清单，每完成一步用 plan_step_update 标记 done。这样用户能在协同工作台实时看到进度。\n\n【多 Agent 协同】当任务需要跨领域协作时，用 collab_create 创建协同会话，用 collab_dispatch_async 并发派发给领域 agent，用 blackboard_set 共享中间结果，最后 collab_wait 汇总。"
+const BaseSystemPrompt = "你是 EverEvo 桌面软件的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程 (ReAct Framework)\n1. 分析 (Thought): 理解用户意图，判断需要什么信息、调用哪些工具。\n2. 行动 (Action): 选择合适的工具，用精确的参数调用。\n3. 观察 (Observation): 仔细阅读工具返回结果。\n4. 重复 直到掌握足够信息，然后给出最终答案。\n5. 最终回答 (Final Answer): 用简洁中文直接回复用户，不要照搬工具输出的原始 JSON。\n\n## 工具使用规则\n- 先思考再行动，失败时分析原因尝试替代方案。\n- JSON 结果提取关键字段后再回复，不要整套贴出。\n- 不需要工具就直接回答。\n\n## 其他\n- 用户说中文用中文回复。文件上传通过 read_file / read_media_file 读取。\n\n## 高级功能\n- 任务规划: 复杂任务用 plan_create 拆解，plan_step_update 标记进度。\n- 多 Agent 协同: collab_create 创建协同会话，collab_dispatch_async 派发，collab_wait 汇总。"
 
 // Manager holds the agent list and handles persistence. All mutating ops take
 // the mutex because concurrent multi-domain delegation + UI CRUD race on the
@@ -99,7 +99,7 @@ func (m *Manager) migrateDefaultPrompt() {
 		if !m.Agents[i].IsDefault {
 			continue
 		}
-		if !strings.Contains(m.Agents[i].SystemPrompt, "【任务规划】") {
+		if !strings.Contains(m.Agents[i].SystemPrompt, "ReAct") {
 			m.Agents[i].SystemPrompt = BaseSystemPrompt
 			m.Agents[i].UpdatedAt = time.Now().UnixMilli()
 			changed = true

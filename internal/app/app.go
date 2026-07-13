@@ -31,6 +31,7 @@ import (
 	"everevo/internal/a2a"
 	"everevo/internal/acp"
 	"everevo/internal/agents"
+	"everevo/internal/async"
 	"everevo/internal/collab"
 	"everevo/internal/feishu"
 	"everevo/internal/mcp"
@@ -71,7 +72,8 @@ type App struct {
 	zone            *zone.Zone                        // current runtime zone
 	sourceDir       string                             // project root for self-compilation ("" if unavailable)
 	acpBridge       *acp.Bridge                        // OpenCode ACP bridge for code modification tasks
-	taskBoard       *taskboard.Board                    // cross-conversation progress tracking
+	taskBoard       *taskboard.Board
+	asyncManager    *async.Manager
 	fileCtl         FileCtl                             // file access control (readonly/audit/full)
 }
 
@@ -454,6 +456,16 @@ func (a *App) Startup(ctx context.Context) {
 		// Migrate legacy 'default' workspace_id to actual library ID.
 		if libID != "" && a.memoryStore != nil {
 			a.memoryStore.MigrateDefaultWorkspace(libID)
+		}
+	}
+
+	// Async task manager (shares memory.db for persistence).
+	if a.memoryStore != nil {
+		if mgr, aErr := async.NewManager(a.memoryStore.DB(), func(event string, data any) {
+			wailsRuntime.EventsEmit(a.ctx, event, data)
+		}); aErr == nil {
+			a.asyncManager = mgr
+			log.Println("异步任务管理器就绪")
 		}
 	}
 

@@ -81,9 +81,11 @@
     <!-- Messages -->
     <div class="chat-panel-box" ref="chatBox" @scroll="onScroll">
       <!-- Load-earlier indicator -->
-      <div v-if="chat.hasMoreMessages" class="chat-load-earlier" @click="chat.loadEarlierMessages()">
-        ↑ 加载更早的对话（当前显示最近 50 条，共 {{ chat.totalMessageCount }} 条）
+      <div v-if="chat.hasMoreMessages && chat.compressionMarker < 0" class="chat-load-earlier">
+        <span v-if="loadingMore" class="chat-loading-spin">◌</span>
+        <span v-else>↑ 上滑加载更早的对话（{{ chat.messages.length }} / {{ chat.totalMessageCount }}）</span>
       </div>
+
       <div v-if="!chat.messages.length" class="chat-empty">
         <span>💬</span>
         <p>用自然语言操作 EverEvo</p>
@@ -93,9 +95,31 @@
         </div>
       </div>
 
-      <template v-for="(m, i) in chat.messages" :key="i">
+      <template v-for="(m, i) in chat.messages" :key="m.id || i">
+        <!-- History messages (before marker): progressively revealed as user scrolls up -->
+        <template v-if="chat.compressionMarker >= 0 && i < chat.compressionMarker && i < chat.compressionMarker - chat.historyVisibleCount"></template>
+        <!-- Toggle button + summary at the marker boundary -->
+        <template v-else-if="chat.compressionMarker >= 0 && i === chat.compressionMarker">
+          <button class="chat-history-boundary-btn"
+                  @click="onToggleHistory">
+            {{ chat.historyVisibleCount > 0
+              ? '▾ 收起压缩前历史 (' + chat.historyRoundCount + ' 轮, ' + chat.historyVisibleCount + '/' + chat.historyMessages.length + ' 条可见)'
+              : '▸ 查看压缩前对话 (' + chat.historyRoundCount + ' 轮, ' + chat.historyMessages.length + ' 条) — 点击或上滑加载' }}
+          </button>
+          <!-- Compression summary — same style as thinking block -->
+          <div class="chat-meta-block chat-meta-think">
+            <div class="chat-meta-head"
+                 @click="chat.expandedTool[i + '-compress'] = !chat.expandedTool[i + '-compress']">
+              <span class="chat-meta-label">上下文压缩</span>
+              <span class="chat-meta-toggle">{{ chat.expandedTool[i + '-compress'] === false ? '展开 ▾' : '收起 ▴' }}</span>
+            </div>
+            <div v-if="chat.expandedTool[i + '-compress'] !== false" class="chat-meta-body"
+                 v-html="chat.chatRender(m.content.replace(/^[━⚠].*\n*/, ''))"></div>
+          </div>
+        </template>
+        <template v-else>
         <!-- User message — box with blue left border -->
-        <div v-if="m.role === 'user'" class="chat-user-msg">
+        <div v-if="m.role === 'user'" class="msg-row chat-user-msg" :class="{ 'chat-history-msg': i < chat.compressionMarker }">
           <div class="chat-user-text" v-html="chat.chatRender(m.content)"></div>
           <!-- File cards attached to this message -->
           <div v-if="chat.messageFiles[i]?.length" class="chat-file-cards">
@@ -113,8 +137,15 @@
           </div>
         </div>
 
+        <!-- Other system message (warning, truncation notice, etc.) -->
+        <div v-else-if="m.role === 'system'"
+             class="msg-row"
+             style="text-align:center;padding:6px 0;color:var(--text-tertiary);font-size:11px;opacity:0.7;">
+          <span v-html="chat.chatRender(m.content)"></span>
+        </div>
+
         <!-- Assistant message — bare, no bubble -->
-        <div v-else-if="m.role === 'assistant'" class="chat-asst-msg">
+        <div v-else-if="m.role === 'assistant'" class="msg-row chat-asst-msg">
           <!-- Reasoning — collapsible full-width block -->
           <div v-if="chat.reasoningContent[i]" class="chat-meta-block chat-meta-think">
             <div class="chat-meta-head" @click="chat.expandedTool[i + '-reasoning'] = !chat.expandedTool[i + '-reasoning']">
@@ -153,6 +184,7 @@
             </div>
           </div>
         </div>
+        </template><!-- end v-else: only show messages after compression marker -->
       </template>
 
       <!-- Thinking / tool-in-progress indicator -->
@@ -176,21 +208,25 @@
       </div>
     </div>
 
+    <!-- Async task panel -->
+    <Transition name="fade">
+      <AsyncPanel v-if="showAsyncPanel" @resume="onResumeAsync" style="margin-bottom: 8px;" />
+    </Transition>
     <!-- Input area (textarea + bottom bar in rounded border box) -->
     <div class="chat-input-section" :class="{ 'effort-max': chat.thinkEffort === 'max' }">
     <div class="chat-input-area">
-      <textarea
-        ref="textareaRef"
-        v-model="chat.inputText"
-        class="chat-panel-textarea"
-        :rows="textareaRows"
-        :placeholder="chat.pendingFiles.length ? '输入问题（可选，留空则让 AI 自行分析文件）…' : '输入指令，或拖拽文件到此处…'"
-        @keydown.enter.exact.prevent="doSend"
-        @keydown.shift.enter.prevent="chat.inputText += '\n'"
-        @input="autoResize"
-        :disabled="chat.busy"
-        @paste="onPaste"
-      ></textarea>
+      <div class="chat-textarea-wrap" :data-replicated-value="chat.inputText">
+        <textarea
+          ref="textareaRef"
+          v-model="chat.inputText"
+          class="chat-panel-textarea"
+          :placeholder="chat.pendingFiles.length ? '输入问题（可选，留空则让 AI 自行分析文件）…' : '输入指令，或拖拽文件到此处…'"
+          @keydown.enter.exact.prevent="doSend"
+          @keydown.shift.enter.prevent="chat.inputText += '\n'"
+          :disabled="chat.busy"
+          @paste="onPaste"
+        ></textarea>
+      </div>
     </div>
 
     <!-- Bottom bar -->
@@ -200,14 +236,26 @@
       <button ref="settingsBtnRef" class="chat-bar-btn" :class="{ active: showSettings }" @click.stop="showSettings = !showSettings" title="设置">⚙</button>
       <!-- Context bar + compress -->
       <div class="chat-ctx-wrap">
-        <div class="chat-ctx-bar" :class="'ctx-' + chat.contextLevel" :title="fmtTokens(chat.contextTokens) + ' / ' + fmtTokens(chat.contextTarget)">
-          <div class="chat-ctx-fill" :style="{ width: Math.min(100, chat.contextPct) + '%' }"></div>
+        <div class="chat-ctx-bar" :class="'ctx-' + chat.contextLevel"
+             :title="'System: ' + fmtTokens(chat.contextBreakdown.system) + ' | Tools: ' + fmtTokens(chat.contextBreakdown.tools) + ' | Memory: ' + fmtTokens(chat.contextBreakdown.memory) + ' | Messages: ' + fmtTokens(chat.contextBreakdown.messages) + ' | Reserved: ' + fmtTokens(chat.contextBreakdown.reserved) + '\nUsable: ' + fmtTokens(chat.contextBreakdown.usable) + ' / Model limit: ' + fmtTokens(chat.contextLimit) + ' (' + chat.contextLimitPct + '%)'">
+          <div class="chat-ctx-fill" :style="{ width: chat.contextBarPct + '%' }"></div>
         </div>
-        <span class="chat-ctx-label">{{ chat.contextPct }}%</span>
+        <span class="chat-ctx-label" :class="'ctx-label-' + chat.contextLevel">{{ chat.contextPct }}%</span>
       </div>
-      <button class="chat-bar-btn" @click="runFullPipeline" title="压缩上下文 + 全处理管线" style="font-size:12px;">↻</button>
+      <button class="chat-bar-btn" :class="{ active: compressing }"
+              @click="runFullPipeline" :disabled="compressing || chat.busy"
+              :title="compressing ? '压缩中…' : '压缩上下文 + 全处理管线'">
+        <span v-if="compressing" class="chat-spin-icon">◌</span>
+        <span v-else style="font-size:12px;">↻</span>
+      </button>
       <ModeSwitcher />
       <div class="chat-bar-spacer"></div>
+      <!-- async task badge -->
+      <button v-if="asyncStore.tasks.length" class="chat-bar-btn"
+              :class="{ active: showAsyncPanel }" @click="showAsyncPanel = !showAsyncPanel"
+              :title="'后台任务: ' + asyncStore.activeCount + ' 进行中'">
+        ⟳<span v-if="asyncStore.activeCount" style="font-size:10px;color:#e0c040;">{{ asyncStore.activeCount }}</span>
+      </button>
       <span class="chat-think-label">{{ thinkLevelLabel }}</span>
       <div class="chat-think-dots" ref="thinkDotsRef"
            @mousedown="onThinkDragStart" @mousemove="onThinkDragMove" @mouseup="onThinkDragEnd" @mouseleave="onThinkDragEnd">
@@ -236,12 +284,16 @@ import { knowledgeApi } from '../api/knowledge'
 import { memoryApi } from '../api/memory'
 import { fmtSize } from '../utils/formatters'
 import ModeSwitcher from "./ModeSwitcher.vue"
+import AsyncPanel from './AsyncPanel.vue'
+import { useAsyncStore, type AsyncTask } from '../stores/asyncStore'
 import { useToast } from '../composables/useToast'
 
 defineProps<{ compact?: boolean }>()
 
 const chat = useChatStore()
 const toast = useToast()
+const asyncStore = useAsyncStore()
+const showAsyncPanel = ref(false)
 const now = ref(Date.now()) // reactive clock — drives live elapsed-time display
 const chatBox = ref<HTMLElement | null>(null)
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
@@ -305,7 +357,6 @@ function onThinkDragEnd() {
   thinkDragging = false
 }
 
-const textareaRows = ref(2)
 let dragCounter = 0
 
 const currentSessionTitle = computed(() => {
@@ -359,31 +410,66 @@ function fmtTokens(n: number): string {
   return String(n)
 }
 
-function autoResize() {
-  const el = textareaRef.value
-  if (!el) return
-  el.style.height = 'auto'
-  const lineHeight = 22
-  const minH = lineHeight * 2 + 16  // 2 rows
-  const maxH = lineHeight * 10 + 16 // 10 rows max
-  const scrollH = el.scrollHeight
-  el.style.height = Math.max(minH, Math.min(maxH, scrollH)) + 'px'
-  // Sync rows attribute for Enter key behavior
-  textareaRows.value = Math.max(2, Math.min(10, Math.ceil((scrollH - 16) / lineHeight)))
-}
-
+const compressing = ref(false)
 async function runFullPipeline() {
-  // Trigger everything: compress context + save summary + extract facts/graph
-  await chat.maybeCompressContext()
-  // Notify backend to run a full extraction pass on all sessions.
-  try { await window.go.app.App.MemoryForceExtract() } catch (_) {}
-  toast.show('info', '全处理管线已触发', '上下文压缩 + 事实提取 + 图谱更新')
+  if (compressing.value || chat.busy) return
+  compressing.value = true
+  const prevTokens = chat.contextTokens
+  try {
+    // force=true: user explicitly requested — bypass busy guard and run at any level.
+    const result = await chat.maybeCompressContext(true)
+    // Also sync with backend extraction pipeline.
+    try { await window.go.app.App.MemoryForceExtract() } catch (_) {}
+
+    const afterTokens = chat.contextTokens
+    const saved = prevTokens - afterTokens
+    switch (result) {
+      case 'compressed':
+        toast.show('success', '上下文已压缩', '从 ' + fmtTokens(prevTokens) + ' 降至 ' + fmtTokens(afterTokens) + '（节省 ' + fmtTokens(Math.max(0, saved)) + ' tokens）')
+        break
+      case 'truncated':
+        toast.show('warning', '上下文已截断', '硬截断已触发 — 最早的消息已被移除（节省 ' + fmtTokens(Math.max(0, saved)) + ' tokens）')
+        break
+      case 'precompute':
+        toast.show('info', '背景压缩已触发', '摘要将在后台生成，完成后自动应用（当前 ' + chat.contextPct + '%）')
+        break
+      case 'warned':
+        toast.show('info', '已注入压缩提示', '已提醒 AI 简洁回复（当前 ' + chat.contextPct + '%）')
+        break
+      default:
+        if (chat.contextPct < 50) {
+          toast.show('info', '无需压缩', '上下文使用率仅 ' + chat.contextPct + '%，低于 50% 阈值')
+        } else {
+          toast.show('info', '全处理管线已触发', '上下文压缩 + 事实提取 + 图谱更新')
+        }
+    }
+  } catch (e: any) {
+    toast.show('error', '压缩失败', e?.message || String(e))
+  } finally {
+    compressing.value = false
+  }
 }
 
 function stopGeneration() {
   chat.stopRequested = true
   if (chat.currentStreamId) {
     try { window.go.app.App.ChatStreamCancel(chat.currentStreamId) } catch (_) {}
+  }
+}
+
+// Resume an async task: inject its result into the current conversation.
+async function onResumeAsync(task: AsyncTask) {
+  const go = (window as any).go?.app?.App
+  if (!go?.ResumeAsyncTask || !chat.currentSessionId) return
+  try {
+    const res = await go.ResumeAsyncTask(task.id, chat.currentSessionId)
+    if (res?.resumeHint) {
+      // Append the resume hint as a system message to prompt the LLM.
+      chat.inputText = res.resumeHint
+      showAsyncPanel.value = false
+    }
+  } catch (e: any) {
+    toast.show('error', '恢复任务失败', e?.message || String(e))
   }
 }
 
@@ -609,14 +695,13 @@ watch(() => {
   return last ? (last.content || '') + '__' + (last.toolResults ? last.toolResults.length : 0) : ''
 }, () => nextTick(() => scrollChat()))
 watch(() => chat.busy, (val) => { if (val) { atBottom.value = true; nextTick(() => scrollChat()) } })
-
 const _nowTimer = setInterval(() => { now.value = Date.now() }, 1000)
 onMounted(() => {
   chat.loadConfig()
   chat.loadSkills()
   chat.loadAgents()
   chat.loadSessions()
-  nextTick(() => scrollChat())
+  nextTick(() => { chat.setChatBoxRef(chatBox.value); scrollChat() })
 })
 onBeforeUnmount(() => { clearInterval(_nowTimer) })
 
@@ -643,9 +728,71 @@ async function onDeleteSession() {
   await chat.deleteSession(id)
 }
 
+const loadingMore = ref(false)
+
+/** Save scroll position, then after DOM update restore to keep the viewport stable. */
+async function saveScrollThenReveal(chatStore: any) {
+  const el = chatBox.value
+  if (!el) return
+  const prevSH = el.scrollHeight
+  const prevST = el.scrollTop
+  // Double-wait: nextTick for Vue DOM update, RAF for browser layout.
+  await nextTick()
+  await new Promise(r => requestAnimationFrame(r))
+  if (!el) return
+  el.scrollTop = prevST + (el.scrollHeight - prevSH)
+}
+
+/** Click handler for the "view compressed history" button. */
+function onToggleHistory() {
+  const el = chatBox.value
+  if (!el) return
+  if (chat.historyVisibleCount > 0) {
+    // Collapse: scroll the marker boundary to the top of the viewport.
+    chat.hideCompressedHistory()
+    nextTick().then(() => {
+      requestAnimationFrame(() => {
+        if (!el || !chatBox.value) return
+        // Find the boundary button and scroll it to top.
+        const btn = el.querySelector('.chat-history-boundary-btn') as HTMLElement
+        if (btn) el.scrollTop = btn.offsetTop - el.offsetTop - 10
+      })
+    })
+    return
+  }
+  // Expand: reveal first batch, keep scroll stable.
+  const prevSH = el.scrollHeight
+  const prevST = el.scrollTop
+  chat.revealMoreHistory()
+  nextTick().then(() => {
+    requestAnimationFrame(() => {
+      if (el) el.scrollTop = prevST + (el.scrollHeight - prevSH)
+    })
+  })
+}
+
 function onScroll() {
   const el = chatBox.value
-  if (el) atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  if (!el) return
+  atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+  // Trigger load-more when scrolling near top (within 60px).
+  if (el.scrollTop < 60 && chat.hasMoreMessages && !loadingMore.value) {
+    loadingMore.value = true
+    chat.loadEarlierMessages().finally(() => { loadingMore.value = false })
+  }
+  // Progressive history reveal: when scrolling near top, reveal next batch.
+  if (chat.compressionMarker >= 0 && chat.historyVisibleCount > 0
+      && chat.historyVisibleCount < chat.historyMessages.length) {
+    if (el.scrollTop < 80) {
+      const prevSH = el.scrollHeight
+      chat.revealMoreHistory()
+      nextTick().then(() => {
+        requestAnimationFrame(() => {
+          if (el) el.scrollTop = el.scrollTop + (el.scrollHeight - prevSH)
+        })
+      })
+    }
+  }
 }
 function scrollChat() {
   if (!atBottom.value) return
@@ -747,6 +894,7 @@ function scrollChat() {
 .chat-panel-box {
   flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
   padding: 14px 14px 16px; scrollbar-gutter: stable;
+  overflow-anchor: none; /* prevent browser scroll-anchoring from fighting manual scrollTop */
 }
 
 /* ── File chips ── */
@@ -786,9 +934,14 @@ function scrollChat() {
   height: 100%; border-radius: 2px; transition: width 0.5s ease;
   background: var(--success);
 }
-.ctx-warn .chat-ctx-fill { background: #d29922; }
+.ctx-warn .chat-ctx-fill     { background: #d29922; }
 .ctx-critical .chat-ctx-fill { background: var(--danger); }
-.chat-ctx-label { font-size: 9px; color: var(--text-tertiary); font-family: var(--font-mono); line-height: 1; min-width: 28px; }
+.ctx-danger .chat-ctx-fill   { background: var(--danger); animation: ctx-pulse 0.8s ease-in-out infinite alternate; }
+@keyframes ctx-pulse { from { opacity: 1; } to { opacity: 0.5; } }
+.chat-ctx-label { font-size: 9px; color: var(--text-tertiary); font-family: var(--font-mono); line-height: 1; min-width: 32px; text-align: right; }
+.ctx-label-warn     { color: #d29922; }
+.ctx-label-critical { color: var(--danger); }
+.ctx-label-danger   { color: var(--danger); font-weight: 700; }
 
 /* ── Input section (textarea + bottom bar) ── */
 .chat-input-section {
@@ -798,11 +951,26 @@ function scrollChat() {
 }
 .chat-input-section.effort-max { border-color: var(--danger); }
 .chat-input-area { padding: 8px 10px 0; }
+.chat-textarea-wrap {
+  display: grid;
+  min-height: 28px; /* matches button height in bottom bar */
+  max-height: 88px; /* 4 rows × ~22px */
+  overflow-y: auto;
+}
+.chat-textarea-wrap::after {
+  content: attr(data-replicated-value) " ";
+  white-space: pre-wrap; visibility: hidden;
+  grid-area: 1 / 1;
+  padding: 4px 4px; border: none;
+  font-family: var(--font); font-size: 13px; line-height: 1.55;
+  word-break: break-word;
+}
 .chat-panel-textarea {
-  width: 100%; padding: 6px 4px; border: none; border-radius: 0;
+  grid-area: 1 / 1;
+  width: 100%; padding: 4px 4px; border: none; border-radius: 0;
   background: transparent; color: var(--text-primary); font-family: var(--font);
-  font-size: 13px; resize: none; outline: none; min-height: 44px; max-height: 200px;
-  line-height: 1.5; overflow-y: auto;
+  font-size: 13px; resize: none; outline: none;
+  line-height: 1.55; overflow: hidden;
 }
 
 /* ── Settings popover ── */
@@ -877,6 +1045,8 @@ function scrollChat() {
 .chat-bar-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
 .chat-bar-btn.active { background: var(--accent-dim); color: var(--accent); }
 .chat-bar-btn:disabled { opacity: 0.3; cursor: default; }
+.chat-spin-icon { animation: spin 1s linear infinite; display: inline-block; font-size: 15px; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .chat-bar-spacer { flex: 1; }
 .chat-model-label {
   font-size: 11px; color: var(--text-tertiary); white-space: nowrap; overflow: hidden;
@@ -910,11 +1080,10 @@ function scrollChat() {
 
 /* ── Messages ── */
 .chat-load-earlier {
-  text-align: center; padding: 8px 0; font-size: 11px;
-  color: var(--accent); cursor: pointer; opacity: 0.7; transition: opacity 0.15s;
+  text-align: center; padding: 14px 0 8px; font-size: 11px;
+  color: var(--text-tertiary); opacity: 0.6;
   border-bottom: 1px solid var(--border-subtle); margin-bottom: 6px;
 }
-.chat-load-earlier:hover { opacity: 1; }
 .chat-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 60px 0; color: var(--text-tertiary); font-size: 14px; }
 .chat-empty span { font-size: 36px; opacity: 0.3; }
 .chat-empty-hint { font-size: 12px; color: var(--text-tertiary); opacity: 0.6; }
@@ -1150,6 +1319,28 @@ function scrollChat() {
 .terminal-output pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .terminal-error .terminal-output { color: rgba(255,140,140,0.85); }
 
+/* ── Compression divider (collapsible accordion) ── */
+.msg-row.chat-compress-divider {
+  align-self: stretch; text-align: center; padding: 10px 0; margin: 6px 0;
+  border-top: 1px solid rgba(180,150,60,0.35); border-bottom: 1px solid rgba(180,150,60,0.35);
+  color: rgba(180,150,60,0.75); font-size: 11px; font-family: var(--font-mono);
+  background: rgba(180,150,60,0.05); user-select: none; cursor: pointer;
+}
+.msg-row.chat-compress-divider:hover { background: rgba(180,150,60,0.1); }
+.chat-compress-summary { font-size: 11px; line-height: 1.5; text-align: left;
+  padding: 6px 14px; color: var(--text-secondary); white-space: pre-wrap; }
+
+/* ── Compression boundary button ── */
+.chat-history-boundary-btn {
+  width: 100%; padding: 7px 14px; border: 1px dashed rgba(100,100,120,0.25);
+  border-radius: var(--radius-sm); background: rgba(100,100,120,0.04);
+  color: var(--text-tertiary); font-size: 11px; cursor: pointer; text-align: left;
+  transition: background 0.15s; font-family: var(--font); margin: 2px 0;
+}
+.chat-history-boundary-btn:hover { background: rgba(100,100,120,0.1); color: var(--text-secondary); }
+/* Grayed-out history messages */
+.chat-history-msg { opacity: 0.55; filter: grayscale(0.4); transition: opacity 0.15s; }
+.chat-history-msg:hover { opacity: 0.75; }
 .chat-meta-body { padding: 0 10px 8px; font-size: 11px; line-height: 1.55; color: var(--text-tertiary); white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; user-select: text; }
 .chat-tool-item-head { font-size: 10px; margin-bottom: 3px; font-family: var(--font-mono); }
 .tool-ok { color: var(--success); }

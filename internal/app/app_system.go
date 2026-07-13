@@ -376,8 +376,8 @@ func (a *App) WebFetch(url, prompt string) (map[string]any, error) {
 
 // stripHTML removes all HTML tags and decodes common entities.
 func stripHTML(s string) string {
-	// Remove scripts, styles, comments
-	re := regexp.MustCompile(`(?is)<(script|style|noscript)[^>]*>.*?</\1>`)
+	// Remove scripts, styles, comments (no backreferences — RE2 doesn't support \1)
+	re := regexp.MustCompile(`(?is)<(?:script|style|noscript)[^>]*>.*?</(?:script|style|noscript)>`)
 	s = re.ReplaceAllString(s, "")
 	re = regexp.MustCompile(`<!--.*?-->`)
 	s = re.ReplaceAllString(s, "")

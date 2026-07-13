@@ -113,6 +113,7 @@ import AccountMenu from './components/AccountMenu.vue'
 import ChatPanel from './components/ChatPanel.vue'
 import { useDownloadStore } from './stores/downloadStore'
 import { useChatStore } from './stores/chatStore'
+import { useAsyncStore } from './stores/asyncStore'
 import { useActiveLibrary } from './composables/useActiveLibrary'
 import { memoryApi } from './api/memory'
 
@@ -220,6 +221,8 @@ onMounted(() => {
   downloadStore.setToast(showToast)
   downloadStore.bindEvents()
   downloadStore.startPolling()
+  // Async task store: background task event listener.
+  useAsyncStore().init()
 })
 onBeforeUnmount(() => {
   stopDynPolling()

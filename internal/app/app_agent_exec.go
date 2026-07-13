@@ -102,6 +102,10 @@ func (a *App) buildAgentSystemPrompt(agent *agents.Agent) string {
 	if strings.TrimSpace(base) == "" {
 		base = agents.BaseSystemPrompt
 	}
+	// Prepend ReAct framework if the agent's prompt doesn't already include it.
+	if !strings.Contains(base, "ReAct") && !strings.Contains(base, "推理-行动") {
+		base = "你是 EverEvo 的 AI 助手，遵循 ReAct（推理-行动）框架工作。\n\n## 工作流程\n1. 分析需求 → 2. 调用工具 → 3. 观察结果 → 4. 重复直至完成 → 5. 最终回答（简洁中文，不照搬 JSON）\n\n## 工具规则\n- 先思考再行动，失败换方案\n- JSON 提取关键字段，不要整套贴出\n- 不需要工具就直接回答\n\n---\n\n" + base
+	}
 	var parts []string
 	for _, s := range a.agentSelectedSkills(agent) {
 		if strings.TrimSpace(s.SystemPrompt) != "" {
