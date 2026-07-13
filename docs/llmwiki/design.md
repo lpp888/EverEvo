@@ -118,7 +118,7 @@ Frontend (Vue 3 + Vite) → Go Backend (Wails v2 API, 15 app_*.go)
 - `internal/guides/` — 引导内容 + 模板同步。内置 EverEvo 使用指南（`//go:embed userguides/*.md` + 内部 `local` 源类型 `syncLocal`，首次启动 `NewManager` seed `everevo` 源并自动 `SyncAll`，不依赖外网）。
 - `internal/toolbox/` — 模型类型探测（metadata / config.json / I/O 形状启发式）+ 句向量推理内核（MiniLM mean-pool）。
 - `internal/security/` — 安全策略管理。
-- `internal/config/` — 配置（`%APPDATA%/EverEvo/`）。
+- `internal/config/` — 配置（项目根目录 `data/zones/{zone}/config.json`）。
 - `internal/storage/` / `internal/sysinfo/` / `internal/auth/` — 数据目录、系统信息（CPU/GPU/内存）、平台鉴权。
 
 ### 前端
