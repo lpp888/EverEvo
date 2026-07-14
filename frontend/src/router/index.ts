@@ -25,6 +25,11 @@ const router = createRouter({
       component: () => import('@/components/ImageClassifierPage.vue'),
     },
     {
+      path: '/memory',
+      name: 'memory',
+      component: () => import('@/components/MemoryPanel.vue'),
+    },
+    {
       path: '/knowledge',
       name: 'knowledge',
       component: () => import('@/components/Knowledge.vue'),

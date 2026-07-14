@@ -8,6 +8,7 @@ import { wikiApi } from '../api/wiki'
 import { knowledgeApi } from '../api/knowledge'
 import { useActiveLibrary } from '../composables/useActiveLibrary'
 import { useAsyncStore } from './asyncStore'
+import { getModelProfile, type ModelProfile } from '../config/modelProfiles'
 import type { MemorySession, MemoryMessage } from '../api/memory'
 
 // Cross-view: last graph recall trace (seed/edge ids). The Knowledge viewer reads
@@ -108,55 +109,6 @@ interface StreamErrorData { error?: string }
  * (can't legally end a request). This is the root fix for the recurring
  * HTTP 400 tool_calls pairing error.
  */
-/**
- * Event-driven wait for async agent runs. Subscribes to collab:event for
- * agent.<id>.done and resolves when every runId in the list has completed.
- * Runs without a backend timeout — the wait naturally ends when all agents
- * finish (or the chat is stopped via stopRequested).
- */
-async function waitForCollabRuns(args: Record<string, unknown>): Promise<ToolCallResult> {
-  const raw = args.runIds
-  if (!Array.isArray(raw) || !raw.length) {
-    return { success: false, error: 'collab_wait: runIds must be a non-empty array' }
-  }
-  const runIds = raw.map(String)
-  const remaining = new Set(runIds)
-  const results: any[] = []
-  const rt = window.runtime as any
-  let stopWatcher: ReturnType<typeof setInterval> | null = null
-
-  const cleanup = () => {
-    rt.EventsOff('collab:event', handler)
-    if (stopWatcher) { clearInterval(stopWatcher); stopWatcher = null }
-  }
-
-  const handler = (envelope: any) => {
-    if (stopRequested.value) { cleanup(); return }
-    const ev = envelope?.data || {}
-    const topic: string = ev.topic || ''
-    const m = topic.match(/^agent\.(.+)\.done$/)
-    if (!m) return
-    const payload = ev.payload || {}
-    const runId: string = payload.runId || ev.source || ''
-    if (!remaining.has(runId)) return
-    remaining.delete(runId)
-    results.push({ runId, agentId: m[1], status: 'done', result: payload.result })
-  }
-
-  return new Promise((resolve) => {
-    let resolved = false
-    const resolveOnce = (r: ToolCallResult) => {
-      if (resolved) return
-      resolved = true; cleanup(); resolve(r)
-    }
-    rt.EventsOn('collab:event', handler)
-    stopWatcher = setInterval(() => {
-      if (remaining.size === 0) { resolveOnce({ success: true, data: results }) }
-      if (stopRequested.value) { resolveOnce({ success: false, error: '用户已终止' }) }
-    }, 300)
-  })
-}
-
 function normalizeToolMessages(msgs: APIMessage[]): APIMessage[] {
   const out: APIMessage[] = []
   for (let i = 0; i < msgs.length; i++) {
@@ -234,12 +186,63 @@ export const useChatStore = defineStore('chat', () => {
   const thinkMode = ref(true)              // extended thinking toggle, default ON
   const thinkEffort = ref<'high' | 'max'>('high')  // effort level (high=default, max=deep)
   const stopRequested = ref(false)          // set to true to stop current generation
+
+  /**
+   * Event-driven wait for async agent runs. Subscribes to collab:event for
+   * agent.<id>.done and resolves when every runId in the list has completed.
+   * Runs without a backend timeout — the wait naturally ends when all agents
+   * finish (or the chat is stopped via stopRequested).
+   */
+  async function waitForCollabRuns(args: Record<string, unknown>): Promise<ToolCallResult> {
+    const raw = args.runIds
+    if (!Array.isArray(raw) || !raw.length) {
+      return { success: false, error: 'collab_wait: runIds must be a non-empty array' }
+    }
+    const runIds = raw.map(String)
+    const remaining = new Set(runIds)
+    const results: any[] = []
+    const rt = window.runtime as any
+    let stopWatcher: ReturnType<typeof setInterval> | null = null
+
+    const cleanup = () => {
+      rt.EventsOff('collab:event', handler)
+      if (stopWatcher) { clearInterval(stopWatcher); stopWatcher = null }
+    }
+
+    const handler = (envelope: any) => {
+      if (stopRequested.value) { cleanup(); return }
+      const ev = envelope?.data || {}
+      const topic: string = ev.topic || ''
+      const m = topic.match(/^agent\.(.+)\.done$/)
+      if (!m) return
+      const payload = ev.payload || {}
+      const runId: string = payload.runId || ev.source || ''
+      if (!remaining.has(runId)) return
+      remaining.delete(runId)
+      results.push({ runId, agentId: m[1], status: 'done', result: payload.result })
+    }
+
+    return new Promise((resolve) => {
+      let resolved = false
+      const resolveOnce = (r: ToolCallResult) => {
+        if (resolved) return
+        resolved = true; cleanup(); resolve(r)
+      }
+      rt.EventsOn('collab:event', handler)
+      stopWatcher = setInterval(() => {
+        if (remaining.size === 0) { resolveOnce({ success: true, data: results }) }
+        if (stopRequested.value) { resolveOnce({ success: false, error: '用户已终止' }) }
+      }, 300)
+    })
+  }
+
   const currentStreamId = ref('')            // track active stream for cancellation
   const reasoningContent = ref<Record<number, string>>({})  // reasoning per message index
   const compressedAt = ref<number>(-1)  // message index where auto-compression happened
   const compressionMarker = ref<number>(-1) // index of the compression divider (apiMsgs starts after this)
   const showCompressedHistory = ref(false) // user toggled to view messages before marker
   const historyVisibleCount = ref(0)        // progressive reveal: how many history msgs to show
+  const compressedRoundCount = ref(0)       // round count at compression time (frozen, not reactive to load-more)
   const HISTORY_BATCH = 20                  // messages per scroll-up batch
   function revealMoreHistory(): number {
     if (compressionMarker.value < 0) return 0
@@ -393,101 +396,30 @@ export const useChatStore = defineStore('chat', () => {
   const _toolDefTokens = ref(0)     // tool definitions (JSON schemas)
   const _memRagTokens = ref(0)      // memory recall + RAG chunks injected into system prompt
 
-  /**
-   * Model's absolute context limit (from capability probe or known defaults).
-   */
-  const contextLimit = computed(() => {
+  // ── Model profile (declarative, per-model config) ──
+  // Replaces the old heuristic contextLimit / contextTarget / contextReserved
+  // with explicit per-model profiles. Edit ../config/modelProfiles.ts to tune.
+  const modelProfile = computed<ModelProfile>(() => {
     const p = activeProvider.value
-    if (!p) return 128000
-    // Trust probed capability first (most accurate)
-    const caps = p.modelCapabilities?.[p.model]
-    if (caps?.maxContextTokens && caps.maxContextTokens > 0) return caps.maxContextTokens
-    // Heuristic fallback for unprobed models
-    const m = (p.model || '').toLowerCase()
-    const n = (p.name || '').toLowerCase()
-    const deepseek = n.includes('deepseek') || m.includes('deepseek')
-    // DeepSeek V4 / GPT-5 / Gemini 2.5+ — current-gen 1M-class
-    if (deepseek && (m.includes('v4') || m.includes('pro') || m.includes('chat'))) return 1_000_000
-    if (m.includes('gemini') && (m.includes('2.5') || m.includes('3'))) return 1_000_000
-    if (m.includes('gpt-5') || m.includes('o4')) return 1_000_000
-    // DeepSeek V3 / R1 / Claude / older GPT — 128K-200K
-    if (deepseek) return 128000
-    return 128000
+    return getModelProfile(p?.name, p?.model)
   })
 
+  /** Model's absolute context window (from the active model profile). */
+  const contextLimit = computed(() => modelProfile.value.contextWindow)
+
   /**
-   * Aggressive dynamic context target (2026 revision).
-   *
-   * Evidence for pushing higher:
-   *   ┌─ DeepSeek V3 paper:    Perfect NIAH at 128K (verified)
-   *   │─ SPLICE (AAAI 2025):   Structured training achieves perfect NIAH
-   *   │─ Chroma Research 2025:  Context rot is NON-UNIFORM — model-specific,
-   *   │                         not a universal curve. Structured content (JSON,
-   *   │                         tool calls, code) suffers LESS decay than prose.
-   *   │─ ActiveContext 2025:    RL-based curation pushes Gemini to 41% success
-   *   │                         on WebArena while cutting tokens 8.8%.
-   *   │─ Production consensus:  Stay ~15-20% under your MEASURED safe budget,
-   *   │                         not the declared limit. For agents doing tool-use
-   *   │                         (structured I/O), the safe budget is HIGHER than
-   *   │                         for narrative QA.
-   *   │─ Karpathy:              "The best context is the one you use. 1M models
-   *   │                         are wasted on 10K prompts."
-   *   └─ Conclusion:            85% target for 1M models, 80% for 128K+.
-   *                             Agent tool-use is structured → less rot.
-   *
-   * Tiers:
-   *   1M+ models (DeepSeek V4, Gemini 2.5+): 85% = 850K usable window
-   *   128K-1M models (DeepSeek V3, Claude, GPT-4o): 80%
-   *   32K-128K models: 70%
-   *   Small ≤32K: 65% (STRING paper still applies to small models)
+   * Usable input budget: context_window × effectivePct.
+   * Codex uses 95% (reserves 5% for system overhead + model output).
    */
-  const contextTarget = computed(() => {
-    const limit = contextLimit.value
-    const p = activeProvider.value
-    const model = (p?.model || '').toLowerCase()
-    const name = (p?.name || '').toLowerCase()
-
-    // Tier 1: 1M+ models — 85% target. 850K is vastly more than any agent
-    // session needs, and structured tool-call content is rot-resistant.
-    if (limit >= 500_000) {
-      return Math.floor(limit * 0.85)
-    }
-
-    // Tier 2: Big models (128K-500K) — 80% target.
-    // DeepSeek V3: perfect NIAH at 128K. Claude/GPT: 60% was too conservative
-    // for structured agent workloads.
-    if (limit >= 128_000) {
-      return Math.floor(limit * 0.80)
-    }
-
-    // Tier 3: Medium models (32K-128K) — 70%
-    if (limit > 32_000) {
-      return Math.floor(limit * 0.70)
-    }
-
-    // Tier 4: Small models — 65% (STRING evidence still valid)
-    return Math.floor(limit * 0.65)
-  })
+  const contextTarget = computed(() =>
+    Math.floor(contextLimit.value * modelProfile.value.effectivePct / 100))
 
   /**
    * Reserved budget: tokens set aside for model output.
-   *
-   * IMPORTANT (DeepSeek API docs):
-   *   Thinking/reasoning tokens are completion_tokens (OUTPUT), NOT prompt_tokens.
-   *   They do NOT consume the context window — they consume max_tokens budget.
-   *
-   * Dynamic: larger windows need proportionally LESS reserved.
-   *   1M window → 5% reserved = 42K (vast overkill for any single response)
-   *   128K window → 8% reserved = 8K (ample for tool-call + response)
-   *   Small window → 10% reserved
+   * Simple: the gap between context window and effective target.
    */
-  const contextReserved = computed(() => {
-    const target = contextTarget.value
-    const limit = contextLimit.value
-    if (limit >= 500_000) return Math.floor(target * 0.05)
-    if (limit >= 128_000) return Math.floor(target * 0.08)
-    return Math.floor(target * 0.10)
-  })
+  const contextReserved = computed(() =>
+    contextLimit.value - contextTarget.value)
 
   /** Usable budget: what we can actually send (target minus reserved). */
   const contextUsable = computed(() => Math.max(0, contextTarget.value - contextReserved.value))
@@ -515,8 +447,10 @@ export const useChatStore = defineStore('chat', () => {
       total += estimateTokens(m.content || '') + MSG_OVERHEAD
       if (m.tool_calls?.length) total += m.tool_calls.length * 20
     }
-    const reasoningTokens = Object.values(reasoningContent.value).reduce((s, t) => s + estimateTokens(t), 0)
-    return total - reasoningTokens
+    // Reasoning content is stored separately in reasoningContent (not in m.content),
+    // so it was never added to `total` — no need to subtract it.
+    // Math.max(0, …) guards against estimation variance producing negative values.
+    return Math.max(0, total)
   })
 
   /** Per-round context growth logging (helps diagnose what's consuming tokens). */
@@ -539,7 +473,7 @@ export const useChatStore = defineStore('chat', () => {
     system: _sysPromptTokens.value,
     tools: _toolDefTokens.value,
     memory: _memRagTokens.value,
-    messages: contextTokens.value - _sysPromptTokens.value - _toolDefTokens.value - _memRagTokens.value,
+    messages: Math.max(0, contextTokens.value - _sysPromptTokens.value - _toolDefTokens.value - _memRagTokens.value),
     reserved: contextReserved.value,
     total: contextTokens.value,
     usable: contextUsable.value,
@@ -673,9 +607,10 @@ export const useChatStore = defineStore('chat', () => {
     })
     compressionMarker.value = cutoff // split point: apiMsgs starts after this
     compressedAt.value = cutoff
-    // Don't load more history beyond the marker (it's been summarised).
-    hasMoreMessages.value = false
-    _olderBuffer = []
+    compressedRoundCount.value = _countRounds(messages.value.slice(0, cutoff))
+    // Reset progressive reveal state — the old count may exceed the new marker.
+    historyVisibleCount.value = 0
+    showCompressedHistory.value = false
 
     // ── Persist only the summary message to DB (don't delete anything) ──
     const sid = currentSessionId.value
@@ -818,7 +753,7 @@ export const useChatStore = defineStore('chat', () => {
    */
   function _truncateForLimit(): boolean {
     const limit = contextLimit.value
-    const safeLimit = Math.floor(limit * 0.88)
+    const safeLimit = Math.floor(limit * modelProfile.value.compactPct / 100)
     if (contextTokens.value <= safeLimit) return false
 
     // If we already have a recent marker, don't add another.
@@ -837,6 +772,9 @@ export const useChatStore = defineStore('chat', () => {
     })
     compressionMarker.value = cutoff
     compressedAt.value = cutoff
+    compressedRoundCount.value = _countRounds(messages.value.slice(0, cutoff))
+    historyVisibleCount.value = 0
+    showCompressedHistory.value = false
 
     return true
   }
@@ -936,6 +874,54 @@ export const useChatStore = defineStore('chat', () => {
   function chatRender(text: string): string {
     if (!text) return ''
     return marked.parse(text, { breaks: true, gfm: true }) as string
+  }
+
+  /** Icon mapping for compression summary sections. */
+  const COMPRESS_SECTION_ICONS: Record<string, string> = {
+    '关键决策': '🎯',
+    '未解决问题': '❓',
+    '涉及文件': '📁',
+    '约束条件': '🔒',
+    '下一步': '👉',
+  }
+
+  /**
+   * Render compression summary with section icons and structured layout.
+   * Input is plain text with 【Section】 headers; output is styled HTML.
+   */
+  function renderCompression(text: string): string {
+    if (!text) return ''
+    // Escape HTML first, then apply section formatting
+    const escaped = text
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // Split on 【...】 section headers, preserving the headers
+    const parts = escaped.split(/【([^】]+)】/)
+    if (parts.length <= 1) {
+      // No structured sections found — render as plain text with line breaks
+      return '<div class="compress-plain">' + escaped.replace(/\n/g, '<br>') + '</div>'
+    }
+    let html = ''
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i].trim()
+      if (!part) continue
+      // Even indices (0, 2, 4...) are content between headers
+      // Odd indices (1, 3, 5...) are the header text inside 【】
+      if (i % 2 === 1) {
+        // Section header
+        const icon = COMPRESS_SECTION_ICONS[part] || '📌'
+        html += '<div class="compress-section"><div class="compress-section-head">'
+          + '<span class="compress-section-icon">' + icon + '</span>'
+          + '<span class="compress-section-title">' + part + '</span>'
+          + '</div><div class="compress-section-body">'
+      } else if (i > 0 && i % 2 === 0) {
+        // Content after a header — close the section
+        html += part.replace(/\n/g, '<br>') + '</div></div>'
+      } else {
+        // Leading content before first header
+        html += '<div class="compress-plain">' + part.replace(/\n/g, '<br>') + '</div>'
+      }
+    }
+    return html
   }
 
   function toast(type: string, title: string, desc?: string) {
@@ -1137,6 +1123,8 @@ export const useChatStore = defineStore('chat', () => {
         const c = messages.value[i].content || ''
         if (c.includes('📦 上下文压缩') || c.includes('上下文已截断')) {
           compressionMarker.value = i
+          compressedAt.value = i
+          compressedRoundCount.value = _countRounds(messages.value.slice(0, i))
           break
         }
       }
@@ -1238,14 +1226,48 @@ export const useChatStore = defineStore('chat', () => {
       const prevScrollHeight = el?.scrollHeight || 0
       const prevScrollTop = el?.scrollTop || 0
 
-      // Prepend batch + shift existing reasoningContent.
+      // Prepend batch + shift existing index-keyed state.
       const shift = batch.length
       const newReasoning: Record<number, string> = {}
       for (const [k, v] of Object.entries(batchReasoning)) newReasoning[Number(k)] = v
       for (const [k, v] of Object.entries(reasoningContent.value)) newReasoning[Number(k) + shift] = v
       reasoningContent.value = newReasoning
 
+      // Shift expandedTool keys (format: "N-suffix" where N is the message index).
+      const newExpanded: Record<string, boolean> = {}
+      for (const [k, v] of Object.entries(expandedTool.value)) {
+        const dash = k.indexOf('-')
+        if (dash > 0) {
+          const idx = Number(k.slice(0, dash))
+          if (!isNaN(idx)) {
+            newExpanded[(idx + shift) + k.slice(dash)] = v
+            continue
+          }
+        }
+        newExpanded[k] = v
+      }
+      expandedTool.value = newExpanded
+
       messages.value = [...batch, ...messages.value]
+
+      // Shift compression state to match the new indices.
+      if (compressionMarker.value >= 0) {
+        // Marker was in the old messages — shift by the prepend amount.
+        compressionMarker.value += shift
+        compressedAt.value += shift
+      } else {
+        // Compression marker may be in the newly loaded batch (it was outside
+        // the initial PAGE_SIZE window). Scan the prepended messages for it.
+        for (let i = batch.length - 1; i >= 0; i--) {
+          const c = batch[i].content || ''
+          if (c.includes('📦 上下文压缩') || c.includes('上下文已截断')) {
+            compressionMarker.value = i
+            compressedAt.value = i
+            compressedRoundCount.value = _countRounds(messages.value.slice(0, i))
+            break
+          }
+        }
+      }
 
       // Restore scroll before the browser paints so the transition is seamless.
       await nextTick()
@@ -1526,13 +1548,18 @@ export const useChatStore = defineStore('chat', () => {
         ? `${basePrompt}\n\n当前启用的能力角色：\n${skillPrompts}`
         : basePrompt
 
-      // P10: Inject domain-scoped context (agents, skills, MCP for this domain only).
+      // P10: Inject domain-scoped context (agents, skills, MCP, tools for this domain).
       const libId = activeLibraryId.value
       if (libId) {
         try {
           const domainCtx = await go.BuildDomainSystemPrompt(libId)
-          if (domainCtx) systemContent += '\n' + domainCtx
-        } catch (_) { /* best-effort: domain context is additive, not required */ }
+          if (domainCtx) {
+            systemContent += '\n' + domainCtx
+          } else {
+            // Fallback: at minimum show which domain we're in.
+            systemContent += `\n【当前领域】${libId}`
+          }
+        } catch (_) { /* best-effort */ }
       }
     }
 
@@ -1547,8 +1574,35 @@ export const useChatStore = defineStore('chat', () => {
     // is bound — zero impact on the chat.
     const userQuery = sanitizeForRecall(lastUserContent())
     if (userQuery) {
+      // ── Layered memory budget (per-source, % of effective context window) ──
+      // Codex: 70% of effective window for memory rollouts. We allocate ~40%
+      // total across all sources (core + summary + turns + facts + graph + exp).
+      // Each source gets a portion; the final MEM_BLOCK_MAX is a hard safety net.
+      const effWin = contextTarget.value
+      const pct = (p: number) => Math.max(200, Math.floor(effWin * p / 100))
+      const BUDGET_CORE   = pct(1.5)  // identity/preferences
+      const BUDGET_SUMMARY = pct(1.0) // current session summary
+      const BUDGET_TURNS   = pct(4.0) // related historical Q&A
+      const BUDGET_FACTS   = pct(1.5) // extracted facts
+      const BUDGET_GRAPH   = pct(2.5) // knowledge graph entities + relations
+      const BUDGET_EXP     = pct(1.5) // distilled experience / lessons
+      const BUDGET_KB      = pct(6.0) // RAG knowledge base chunks
+      const BUDGET_WIKI    = pct(4.0) // project docs (llmwiki)
+      const MEM_BLOCK_MAX  = pct(20)  // overall safety net (~22% total)
+      // Middle-truncation: keep head (60%) + tail (40%), drop middle.
+      // Preserves both opening context and closing details (Codex-style).
+      function _trunc(s: string, max: number): string {
+        if (s.length <= max) return s
+        const headLen = Math.floor(max * 0.6)
+        const tailLen = max - headLen - 30  // 30 chars for the marker
+        if (tailLen <= 0) return s.slice(0, max) + '…'
+        return s.slice(0, headLen)
+          + `\n…[省略 ${s.length - max} 字符]…\n`
+          + s.slice(-tailLen)
+      }
+
       try {
-        const result = await memoryApi.recall(userQuery, 3) || { turns: [], facts: [], graph: '', graphTrace: { seedIds: [], edgeIds: [] }, core: [] }
+        const result = await memoryApi.recall(userQuery, 3, activeLibraryId.value) || { turns: [], facts: [], graph: '', graphTrace: { seedIds: [], edgeIds: [] }, core: [] }
         // P7.3: rule-based library routing — which domain libraries match this query?
         let libMatch = ''
         const q = userQuery.toLowerCase()
@@ -1568,42 +1622,55 @@ export const useChatStore = defineStore('chat', () => {
         }
         const parts: string[] = []
         if (libMatch) parts.push(libMatch)
+
         // P5: forced core memory (identity/preferences) — always injected, never decayed.
         if (result.core?.length) {
-          parts.push('核心记忆（身份与偏好，永久）：\n' + result.core.map((f: any) => `- ${f.value}`).join('\n'))
+          parts.push('核心记忆（身份与偏好，永久）：\n' + _trunc(
+            result.core.map((f: any) => `- ${f.value}`).join('\n'), BUDGET_CORE))
         }
         // P3.6: session summary (already loaded via sessionList).
         const curSession = sessions.value.find(s => s.id === currentSessionId.value)
         if (curSession?.summary) {
-          parts.push('会话摘要：\n' + curSession.summary)
+          parts.push('会话摘要：\n' + _trunc(curSession.summary, BUDGET_SUMMARY))
         }
         if (result.turns?.length) {
-          parts.push('相关历史问答：\n' + result.turns.map((t, i) => `${i + 1}. 问：${t.content}\n   答：${t.reply}`).join('\n'))
+          parts.push('相关历史问答：\n' + _trunc(
+            result.turns.map((t, i) => `${i + 1}. 问：${t.content}\n   答：${t.reply}`).join('\n'), BUDGET_TURNS))
         }
         if (result.facts?.length) {
-          parts.push('已知事实：\n' + result.facts.map((f, i) => `${i + 1}. [${f.category}] ${f.content}`).join('\n'))
+          parts.push('已知事实：\n' + _trunc(
+            result.facts.map((f, i) => `${i + 1}. [${f.category}] ${f.content}`).join('\n'), BUDGET_FACTS))
         }
-        if (result.graph) {
-          parts.push('知识图谱（相关实体与关系）：\n' + result.graph)
+        // P2: knowledge graph — vector-seeded 2-hop expansion.
+        // Fall back to keyword-based node search when the vector path is empty.
+        let graphText = result.graph || ''
+        if (!graphText) {
+          try {
+            graphText = await memoryApi.recallGraphContext(userQuery, activeLibraryId.value) || ''
+          } catch (_) { /* best-effort */ }
+        }
+        if (graphText) {
+          parts.push('知识图谱（相关实体与关系）：\n' + _trunc(graphText, BUDGET_GRAPH))
         }
         // P8: distilled experience recall
         try {
-          const expItems = await memoryApi.recallExperience(activeLibraryId.value, 3) || []
+          const expItems = await memoryApi.recallExperience('', 3) || []  // experience is global, not domain-scoped
           if (expItems.length) {
-            parts.push('经验教训（过去的反思沉淀）：\n' + expItems.map((e: any) => `- [${e.kind}] ${e.content}`).join('\n'))
+            parts.push('经验教训（过去的反思沉淀）：\n' + _trunc(
+              expItems.map((e: any) => `- [${e.kind}] ${e.content}`).join('\n'), BUDGET_EXP))
           }
         } catch (_) { /* best-effort */ }
         lastGraphTrace.value = result.graphTrace || { seedIds: [], edgeIds: [] }
         if (parts.length) {
           let memBlock = parts.join('\n')
-          if (memBlock.length > 1200) memBlock = memBlock.slice(0, 1200) + '…'
+          if (memBlock.length > MEM_BLOCK_MAX) memBlock = memBlock.slice(0, MEM_BLOCK_MAX) + '…'
           systemContent += '\n\n长期记忆（与当前问题相关的过往信息，仅供参考，可能过时）：\n' + memBlock
         }
       } catch (e) { console.error('[chat] recall failed:', errMsg(e)) }
       // P6.1: project-docs recall (llmwiki) — surface relevant design/task notes.
       try {
         const wiki = await wikiApi.recall(activeLibraryId.value, userQuery)
-        if (wiki) systemContent += '\n\n项目文档（与问题相关的设计/任务记录）：\n' + wiki
+        if (wiki) systemContent += '\n\n项目文档（与问题相关的设计/任务记录）：\n' + _trunc(wiki, BUDGET_WIKI)
       } catch (_) {}
 	      // P9: RAG knowledge base recall — auto-inject relevant KB chunks into context.
 	      try {
@@ -1612,11 +1679,21 @@ export const useChatStore = defineStore('chat', () => {
 	          let ragBlock = ragHits.map((h: any) =>
 	            `[${h.kbName}, ${(h.similarity * 100).toFixed(0)}%] ${h.content}`
 	          ).join('\n')
-	          if (ragBlock.length > 1500) ragBlock = ragBlock.slice(0, 1500) + '…'
+	          ragBlock = _trunc(ragBlock, BUDGET_KB)
 	          systemContent += '\n\n知识库检索结果（来自知识库的相关文档片段，请参考这些内容回答用户问题）：\n' + ragBlock
 	        }
 	      } catch (_) {}
 	    }
+
+    // ── Transparent token budget (Codex-style) ──
+    // Tell the model exactly how much context remains. Codex injects:
+    //   "You have {N} tokens left in this context window."
+    // We always include it — the model self-manages better with visibility.
+    {
+      const remaining = contextTarget.value - contextTokens.value
+      const pct = Math.round(contextTokens.value / Math.max(1, contextTarget.value) * 100)
+      systemContent += `\n\n[Token Budget] Context window: ${fmtTokens(contextLimit.value)} total, ${fmtTokens(contextTarget.value)} usable. Currently using ${fmtTokens(contextTokens.value)} (${pct}%). ${fmtTokens(remaining)} tokens remaining.`
+    }
 
     const apiMsgs: APIMessage[] = normalizeToolMessages([
       { role: 'system', content: systemContent },
@@ -1743,10 +1820,12 @@ export const useChatStore = defineStore('chat', () => {
           if (agentStream) {
             agentsApi.streamAs(streamId, sendMsgs, toolPayload, agentStream.providerId, agentStream.model, agentStream.temperature, agentStream.maxTokens, effort).catch(reject)
           } else {
-            // Default path: use ChatStreamAs with dynamic max_tokens based on available budget.
+            // Use the model profile's declared maxOutputTokens directly.
+            // Over-allocating max_tokens is harmless — the model stops at
+            // finish_reason="stop" when done (Codex doesn't even set it).
+            // Only clamp when context is truly full.
             const defP = activeProvider.value
-            const maxOut = Math.min(16384, Math.max(4096,
-              contextLimit.value - contextTokens.value - 2000))
+            const maxOut = modelProfile.value.maxOutputTokens
             go.ChatStreamAs(streamId, sendMsgs, toolPayload,
               defP?.id || '', defP?.model || '', -1, maxOut, effort).catch(reject)
           }
@@ -1939,13 +2018,13 @@ export const useChatStore = defineStore('chat', () => {
   return {
     // state
     messages, inputText, busy, expandedTool, providers, activeId, skills, agents, selectedAgentId,
-    sessions, currentSessionId, pendingFiles, messageFiles, hasMoreMessages, totalMessageCount, thinkMode, thinkEffort, stopRequested, currentStreamId, reasoningContent, compressedAt, compressionMarker, showCompressedHistory, historyVisibleCount, historyMessages, historyRoundCount, apiMessages, revealMoreHistory, hideCompressedHistory,
+    sessions, currentSessionId, pendingFiles, messageFiles, hasMoreMessages, totalMessageCount, thinkMode, thinkEffort, stopRequested, currentStreamId, reasoningContent, compressedAt, compressionMarker, compressedRoundCount, showCompressedHistory, historyVisibleCount, historyMessages, historyRoundCount, apiMessages, revealMoreHistory, hideCompressedHistory,
     contextTokens, contextTarget, contextLimit, contextUsable, contextReserved,
     contextPct, contextBarPct, contextLimitPct, contextLevel, contextBreakdown,
     // getters
     activeProvider, chatReady, suggestedPrompts, selectedAgentName, visibleAgents, activeLibraryId,
     // helpers
-    errMsg, chatRole, chatRender,
+    errMsg, chatRole, chatRender, renderCompression,
     // actions
     loadConfig, loadSkills, loadAgents, selectAgent, clearMessages, sendMessage, toggleToolResult,
     loadSessions, createSession, selectSession, renameSession, deleteSession,

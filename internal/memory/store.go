@@ -872,15 +872,23 @@ func (s *Store) AddUserFact(id, key, value, category, importance, source, worksp
 	return err
 }
 
-// ListUserFacts returns core-memory rows for a domain library (newest first).
-// workspaceID "" → all (global view); otherwise scoped to that library.
+// ListUserFacts returns core-memory rows (newest first).
+// workspaceID ""   → global facts only (workspace_id = '' OR NULL OR 'default').
+// workspaceID "*"  → all facts (no filter, for admin views).
+// workspaceID "xxx"→ domain-scoped facts only.
 func (s *Store) ListUserFacts(workspaceID string) ([]UserFact, error) {
 	var rows *sql.Rows
 	var err error
-	if workspaceID == "" {
+	switch {
+	case workspaceID == "":
+		// Global facts: unassigned or default, shared across all domains.
+		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = '' OR workspace_id = 'default' OR workspace_id IS NULL ORDER BY created_at DESC`)
+	case workspaceID == "*":
+		// Admin view: all facts regardless of domain.
 		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts ORDER BY created_at DESC`)
-	} else {
-		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = ? OR workspace_id = ? OR workspace_id = 'default' OR workspace_id IS NULL OR workspace_id = '' ORDER BY created_at DESC`, workspaceID, s.realDefaultLibrary())
+	default:
+		// Domain-scoped: only this domain's facts.
+		rows, err = s.db.Query(`SELECT id, key, value, category, importance, locked, source, created_at FROM user_facts WHERE workspace_id = ? ORDER BY created_at DESC`, workspaceID)
 	}
 	if err != nil {
 		return nil, err

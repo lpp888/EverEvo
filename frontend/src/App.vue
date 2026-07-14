@@ -127,6 +127,7 @@ const navItems = [
   { route: 'my-models', icon: '□', label: '我的模型' },
   { route: 'similarity', icon: '≈', label: '语义相似度' },
   { route: 'image-classifier', icon: '◫', label: '图像分类' },
+  { route: 'memory', icon: '🧠', label: '记忆' },
   { route: 'knowledge', icon: '◈', label: '领域' },
   { route: 'guides', icon: '☰', label: '攻略' },
   { route: 'plugins', icon: '⊕', label: '插件' },

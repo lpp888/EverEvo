@@ -103,7 +103,7 @@ export const memoryApi = {
   messageClear(sessionId: string) { return call(() => App().MemoryMessageClear(sessionId)) },
 
   /** Semantic recall: past Q&A turns + extracted facts relevant to the query. */
-  recall(query: string, k: number) { return call<RecallResult>(() => App().MemoryRecall(query, k)) },
+  recall(query: string, k: number, libraryId = '') { return call<RecallResult>(() => App().MemoryRecallScoped(query, k, libraryId)) },
   /** Store a finalized user→assistant turn; triggers async fact extraction. */
   remember(userText: string, reply: string, sessionId: string, libraryId = '') {
     return call(() => App().MemoryRemember(userText, reply, sessionId, libraryId))

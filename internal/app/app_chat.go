@@ -199,6 +199,31 @@ type chatOpts struct {
 // building the request body (OpenAI or Anthropic) and normalizing the response
 // to OpenAI shape. Shared by ChatProxy (active provider, default opts) and the
 // local-agent execution loop (provider/model override + custom opts).
+// safeRawJSON validates that data is valid JSON before wrapping in json.RawMessage.
+// json.RawMessage.MarshalJSON() causes a fatal crash on invalid input; this prevents that.
+func safeRawJSON(data json.RawMessage) json.RawMessage {
+	if len(data) == 0 {
+		return json.RawMessage("null")
+	}
+	var v any
+	if err := json.Unmarshal(data, &v); err != nil {
+		log.Printf("[chat] WARNING: invalid JSON passed as RawMessage: %v (first 200 chars: %.200q)", err, string(data))
+		return json.RawMessage("null")
+	}
+	return data
+}
+
+// mustMarshal marshals v to JSON. On error it logs and returns "{}" instead of
+// crashing (json.RawMessage.MarshalJSON fires a fatal error on invalid input).
+func mustMarshal(v any) []byte {
+	bodyBytes, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("[chat] FATAL: json.Marshal failed: %v", err)
+		return []byte("{}")
+	}
+	return bodyBytes
+}
+
 func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json.RawMessage, opts chatOpts) (map[string]any, error) {
 	base := strings.TrimRight(p.Endpoint, "/")
 
@@ -225,7 +250,7 @@ func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json
 		if opts.Temperature != nil {
 			bodyMap["temperature"] = *opts.Temperature
 		}
-		bodyBytes, _ := json.Marshal(bodyMap)
+		bodyBytes := mustMarshal(bodyMap)
 		reqBody = string(bodyBytes)
 	} else {
 		// OpenAI — pass through with explicit stream: false
@@ -240,7 +265,7 @@ func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json
 		// tools array with tool_choice:auto is rejected by some providers.
 		toolsTrimmed := strings.TrimSpace(string(toolsJSON))
 		if toolsTrimmed != "" && toolsTrimmed != "null" && toolsTrimmed != "[]" {
-			bodyMap["tools"] = json.RawMessage(toolsJSON)
+			bodyMap["tools"] = safeRawJSON(toolsJSON)
 			bodyMap["tool_choice"] = "auto"
 		}
 		if opts.Temperature != nil {
@@ -249,7 +274,7 @@ func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json
 		if opts.MaxTokens > 0 {
 			bodyMap["max_tokens"] = opts.MaxTokens
 		}
-		bodyBytes, _ := json.Marshal(bodyMap)
+		bodyBytes := mustMarshal(bodyMap)
 		reqBody = string(bodyBytes)
 	}
 
@@ -551,7 +576,7 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 			bodyMap["temperature"] = *opts.Temperature
 		}
 		thinkApplyBody(bodyMap, p.APIFormat, opts.ThinkEffort)
-		bodyBytes, _ := json.Marshal(bodyMap)
+		bodyBytes := mustMarshal(bodyMap)
 		reqBody = string(bodyBytes)
 	} else {
 		var msgsArr []map[string]any
@@ -563,7 +588,7 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 		}
 		toolsTrimmed := strings.TrimSpace(string(toolsJSON))
 		if toolsTrimmed != "" && toolsTrimmed != "null" && toolsTrimmed != "[]" {
-			bodyMap["tools"] = json.RawMessage(toolsJSON)
+			bodyMap["tools"] = safeRawJSON(toolsJSON)
 			bodyMap["tool_choice"] = "auto"
 		}
 		if opts.Temperature != nil {
@@ -573,7 +598,7 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 			bodyMap["max_tokens"] = opts.MaxTokens
 		thinkApplyBody(bodyMap, p.APIFormat, opts.ThinkEffort)
 		}
-		bodyBytes, _ := json.Marshal(bodyMap)
+		bodyBytes := mustMarshal(bodyMap)
 		reqBody = string(bodyBytes)
 	}
 

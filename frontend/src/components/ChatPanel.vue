@@ -81,7 +81,10 @@
     <!-- Messages -->
     <div class="chat-panel-box" ref="chatBox" @scroll="onScroll">
       <!-- Load-earlier indicator -->
-      <div v-if="chat.hasMoreMessages && chat.compressionMarker < 0" class="chat-load-earlier">
+      <!-- Load-earlier indicator: hidden while compressed history is partially revealed,
+           to avoid clashing with the boundary button. Shows when no compression is
+           active, or after all compressed history has been expanded. -->
+      <div v-if="chat.hasMoreMessages && (chat.compressionMarker < 0 || chat.historyVisibleCount >= chat.historyMessages.length)" class="chat-load-earlier">
         <span v-if="loadingMore" class="chat-loading-spin">◌</span>
         <span v-else>↑ 上滑加载更早的对话（{{ chat.messages.length }} / {{ chat.totalMessageCount }}）</span>
       </div>
@@ -106,15 +109,16 @@
               ? '▾ 收起压缩前历史 (' + chat.historyRoundCount + ' 轮, ' + chat.historyVisibleCount + '/' + chat.historyMessages.length + ' 条可见)'
               : '▸ 查看压缩前对话 (' + chat.historyRoundCount + ' 轮, ' + chat.historyMessages.length + ' 条) — 点击或上滑加载' }}
           </button>
-          <!-- Compression summary — same style as thinking block -->
-          <div class="chat-meta-block chat-meta-think">
+          <!-- Compression summary card — teal accent, structured sections -->
+          <div class="chat-meta-block chat-meta-compress">
             <div class="chat-meta-head"
                  @click="chat.expandedTool[i + '-compress'] = !chat.expandedTool[i + '-compress']">
               <span class="chat-meta-label">上下文压缩</span>
-              <span class="chat-meta-toggle">{{ chat.expandedTool[i + '-compress'] === false ? '展开 ▾' : '收起 ▴' }}</span>
+              <span class="chat-meta-badge">{{ chat.compressedRoundCount }} 轮</span>
+              <span class="chat-meta-toggle">{{ chat.expandedTool[i + '-compress'] === true ? '收起 ▴' : '展开 ▾' }}</span>
             </div>
-            <div v-if="chat.expandedTool[i + '-compress'] !== false" class="chat-meta-body"
-                 v-html="chat.chatRender(m.content.replace(/^[━⚠].*\n*/, ''))"></div>
+            <div v-if="chat.expandedTool[i + '-compress'] === true" class="chat-meta-body chat-compress-body"
+                 v-html="chat.renderCompression(m.content.replace(/^[━⚠].*\n*/, ''))"></div>
           </div>
         </template>
         <template v-else>
@@ -751,12 +755,8 @@ function onToggleHistory() {
     // Collapse: scroll the marker boundary to the top of the viewport.
     chat.hideCompressedHistory()
     nextTick().then(() => {
-      requestAnimationFrame(() => {
-        if (!el || !chatBox.value) return
-        // Find the boundary button and scroll it to top.
-        const btn = el.querySelector('.chat-history-boundary-btn') as HTMLElement
-        if (btn) el.scrollTop = btn.offsetTop - el.offsetTop - 10
-      })
+      const btn = el.querySelector('.chat-history-boundary-btn') as HTMLElement
+      if (btn) btn.scrollIntoView({ block: 'start', behavior: 'instant' })
     })
     return
   }
@@ -776,22 +776,22 @@ function onScroll() {
   if (!el) return
   atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
   // Trigger load-more when scrolling near top (within 60px).
+  // When load-more is available, it takes priority over progressive reveal —
+  // newly loaded messages naturally expand the compressed history.
   if (el.scrollTop < 60 && chat.hasMoreMessages && !loadingMore.value) {
     loadingMore.value = true
     chat.loadEarlierMessages().finally(() => { loadingMore.value = false })
-  }
-  // Progressive history reveal: when scrolling near top, reveal next batch.
-  if (chat.compressionMarker >= 0 && chat.historyVisibleCount > 0
-      && chat.historyVisibleCount < chat.historyMessages.length) {
-    if (el.scrollTop < 80) {
-      const prevSH = el.scrollHeight
-      chat.revealMoreHistory()
-      nextTick().then(() => {
-        requestAnimationFrame(() => {
-          if (el) el.scrollTop = el.scrollTop + (el.scrollHeight - prevSH)
-        })
+  } else if (chat.compressionMarker >= 0 && chat.historyVisibleCount > 0
+      && chat.historyVisibleCount < chat.historyMessages.length
+      && el.scrollTop < 80) {
+    // Progressive history reveal: only when load-more is exhausted.
+    const prevSH = el.scrollHeight
+    chat.revealMoreHistory()
+    nextTick().then(() => {
+      requestAnimationFrame(() => {
+        if (el) el.scrollTop = el.scrollTop + (el.scrollHeight - prevSH)
       })
-    }
+    })
   }
 }
 function scrollChat() {
@@ -1342,6 +1342,47 @@ function scrollChat() {
 .chat-history-msg { opacity: 0.55; filter: grayscale(0.4); transition: opacity 0.15s; }
 .chat-history-msg:hover { opacity: 0.75; }
 .chat-meta-body { padding: 0 10px 8px; font-size: 11px; line-height: 1.55; color: var(--text-tertiary); white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow-y: auto; user-select: text; }
+
+/* ── Compression card (teal accent — distinct from thinking gold) ── */
+.chat-meta-compress { border-left: 3px solid rgba(80,180,180,0.5); background: rgba(80,180,180,0.04); }
+.chat-meta-compress .chat-meta-head:hover { background: rgba(80,180,180,0.08); }
+.chat-meta-compress .chat-meta-label { color: rgba(80,180,180,0.9); }
+.chat-meta-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 3px;
+  background: rgba(80,180,180,0.12); color: rgba(80,180,180,0.75);
+  font-weight: 500; flex-shrink: 0;
+}
+
+/* Compression body — lighter background for readability */
+.chat-compress-body {
+  background: rgba(0,0,0,0.12); border-top: 1px solid rgba(255,255,255,0.03);
+  padding: 8px 12px !important; line-height: 1.65 !important; max-height: 320px !important;
+}
+
+/* Structured section */
+.compress-section {
+  margin-bottom: 6px;
+}
+.compress-section:last-child { margin-bottom: 0; }
+.compress-section-head {
+  display: flex; align-items: center; gap: 5px;
+  padding: 3px 0; margin-bottom: 2px;
+}
+.compress-section-icon { font-size: 13px; flex-shrink: 0; }
+.compress-section-title {
+  font-size: 11px; font-weight: 600;
+  color: rgba(80,200,200,0.8);
+  letter-spacing: 0.02em;
+}
+.compress-section-body {
+  font-size: 11px; color: rgba(200,210,215,0.7);
+  padding-left: 18px; line-height: 1.6;
+}
+
+/* Fallback: unstructured compression text */
+.compress-plain {
+  font-size: 11px; color: rgba(200,210,215,0.7); line-height: 1.6;
+}
 .chat-tool-item-head { font-size: 10px; margin-bottom: 3px; font-family: var(--font-mono); }
 .tool-ok { color: var(--success); }
 .tool-err { color: var(--danger); }

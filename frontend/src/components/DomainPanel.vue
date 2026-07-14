@@ -4,6 +4,7 @@
     <div v-if="err" class="dp-err">{{ err }}</div>
     <div v-else-if="!ready">加载中…</div>
     <div v-else>
+      <!-- ═══════ 领域选择 + 领域内容 ═══════ -->
       <select v-model="activeLibId" @change="onSwitch" class="dp-select">
         <option v-for="lib in libs" :key="lib.id" :value="lib.id">{{ lib.icon || '📚' }} {{ lib.name }}</option>
       </select>
@@ -115,6 +116,7 @@ const skills = ref<any[]>([])
 const err = ref('')
 const ready = ref(false)
 const busy = ref(false)
+
 
 // KB management state
 const showCreateKB = ref(false)
@@ -276,5 +278,6 @@ async function loadKBDocs(kbId: string) {
 .btn-danger:hover { background: #3a1a1a; }
 
 .field { background: #121215; border: 1px solid #333; border-radius: 5px; padding: 6px 10px; color: #e0e0e0; }
+
 .kg-search { background: #0a0a0e; border: 1px solid #333; border-radius: 5px; color: #e0e0e0; padding: 4px 10px; font-size: 0.85em; }
 </style>

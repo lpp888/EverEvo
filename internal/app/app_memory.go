@@ -193,7 +193,8 @@ func (a *App) MemoryRecallScoped(query string, k int, libraryID string) (map[str
 	// P2: graph retrieval reuses the same embedding (no double-embedding).
 	graph, _ := a.memoryStore.RetrieveGraph(emb, k, libraryID)
 	graphTrace := a.memoryStore.RetrieveGraphTrace(emb, k, libraryID)
-	core, _ := a.memoryStore.ListUserFacts(libraryID)
+	// Core memory is GLOBAL (identity/preferences), shared across all domains.
+	core, _ := a.memoryStore.ListUserFacts("")
 	if core == nil {
 		core = []memory.UserFact{}
 	}
