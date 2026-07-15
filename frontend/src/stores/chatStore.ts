@@ -111,8 +111,26 @@ interface StreamErrorData { error?: string }
  */
 function normalizeToolMessages(msgs: APIMessage[]): APIMessage[] {
   const out: APIMessage[] = []
+  // Track all valid tool_call_ids from assistant messages in the visible set.
+  // When context truncation drops an assistant message but keeps its tool
+  // responses, those orphan tool msgs cause HTTP 400 (DeepSeek/OpenAI:
+  // "tool role must be a response to a preceding message with tool_calls").
+  // We pre-scan then drop orphan tool messages that have no matching assistant.
+  const validToolIds = new Set<string>()
+  for (const m of msgs) {
+    if (m.role === 'assistant' && m.tool_calls?.length) {
+      for (const tc of m.tool_calls) validToolIds.add(tc.id)
+    }
+  }
+
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i]
+    // Drop orphan tool messages — no matching assistant.tool_calls in context.
+    if (m.role === 'tool') {
+      if (!m.tool_call_id || !validToolIds.has(m.tool_call_id)) {
+        continue
+      }
+    }
     // Drop a dangling trailing assistant.tool_calls with zero following tool
     // results — it can't be repaired meaningfully and would 400/422.
     if (m.role === 'assistant' && m.tool_calls?.length) {
@@ -1814,6 +1832,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       // Hard guard: if still over the absolute model limit, truncate.
       _truncateForLimit()
+      _cleanOrphanToolMessages()
       const msgIdx = messages.value.length
       const asstId = _tempId()
       messages.value.push({ id: asstId, role: 'assistant', content: '' })
