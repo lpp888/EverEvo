@@ -194,6 +194,23 @@ export const MODEL_PRESETS: Record<string, ModelProfile> = {
     compactPct: 85,
     supportsThinkingBudget: false,
   },
+  // Qwen3.5 — before 'qwen' so "qwen3.5" doesn't fall through to generic
+  'qwen3.5-9b': {
+    label: 'Qwen3.5 9B',
+    contextWindow: 65_536,
+    maxOutputTokens: 0,
+    effectivePct: 95,
+    compactPct: 90,
+    supportsThinkingBudget: false,
+  },
+  'qwen3.5': {
+    label: 'Qwen3.5',
+    contextWindow: 65_536,
+    maxOutputTokens: 0,
+    effectivePct: 95,
+    compactPct: 90,
+    supportsThinkingBudget: false,
+  },
   'qwen': {
     label: 'Qwen (generic)',
     contextWindow: 131_072,

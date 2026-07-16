@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -281,42 +282,20 @@ func (a *App) ShellExec(command string, cwd string, timeoutSec int) (map[string]
 
 // ─── Web Search (DuckDuckGo) ─────────────────────────────────
 
-// WebSearch uses DuckDuckGo's HTML instant answer API (free, no key needed).
+// WebSearch performs a composite multi-engine web search (Bing + DuckDuckGo).
+// Each engine runs concurrently; failures are logged and skipped.
+// Results are merged and deduplicated by URL.
 func (a *App) WebSearch(query string) ([]map[string]any, error) {
-	url := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s", strings.ReplaceAll(query, " ", "+"))
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	client := httpclient.New(15 * time.Second)
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("search request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-	htmlStr := string(body)
-
-	// Extract results with simple regex — robust enough for DuckDuckGo's HTML.
-	linkRe := regexp.MustCompile(`<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>`)
-	snippetRe := regexp.MustCompile(`<a[^>]*class="result__snippet"[^>]*>([^<]*)</a>`)
-
-	links := linkRe.FindAllStringSubmatch(htmlStr, 10)
-	snippets := snippetRe.FindAllStringSubmatch(htmlStr, 10)
-
-	var results []map[string]any
-	for i, l := range links {
-		if len(l) < 3 { continue }
-		snippet := ""
-		if i < len(snippets) && len(snippets[i]) > 1 {
-			snippet = strings.TrimSpace(snippets[i][1])
+	results := compositeSearch(query)
+	out := make([]map[string]any, len(results))
+	for i, r := range results {
+		out[i] = map[string]any{
+			"title":   r.Title,
+			"url":     r.URL,
+			"snippet": r.Snippet,
 		}
-		results = append(results, map[string]any{
-			"title":   strings.TrimSpace(l[2]),
-			"url":     l[1],
-			"snippet": snippet,
-		})
 	}
-	return results, nil
+	return out, nil
 }
 
 // ─── Web Fetch (URL → text) ─────────────────────────────────
@@ -324,17 +303,31 @@ func (a *App) WebSearch(query string) ([]map[string]any, error) {
 // WebFetch fetches a URL and extracts usable text content, stripping HTML when
 // detected. Optional prompt extracts a targeted excerpt (2KB around matching
 // keywords). Limits response body to 256KB.
-func (a *App) WebFetch(url, prompt, depth string) (map[string]any, error) {
+func (a *App) WebFetch(urlStr, prompt, depth string) (map[string]any, error) {
 	if depth == "" {
 		depth = "summary"
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	client := httpclient.New(15 * time.Second)
+		parsedURL, _ := url.Parse(urlStr)
+		host := ""
+		if parsedURL != nil {
+			host = parsedURL.Host
+		}
+		req, _ := http.NewRequest("GET", urlStr, nil)
+		// Pick headers based on the target domain.
+		if strings.Contains(host, "bing.com") {
+			setHeaders(req, edgeHeaders)
+		} else {
+			setHeaders(req, chromeHeaders)
+		}
+		// For Chinese sites, add a Referer to look more natural.
+		if strings.Contains(host, "baidu.com") || strings.Contains(host, "sogou.com") || strings.Contains(host, "zhihu.com") || strings.Contains(host, "csdn.net") {
+			req.Header.Set("Referer", "https://"+host+"/")
+		}
+		client := httpclient.New(15 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch %s failed: %w", url, err)
+		return nil, fmt.Errorf("error fetching %s: %w", urlStr, err)
 	}
 	defer resp.Body.Close()
 
@@ -351,9 +344,9 @@ func (a *App) WebFetch(url, prompt, depth string) (map[string]any, error) {
 	// lightweight provider to keep context impact minimal (Haiku-gate pattern).
 	originalSize := len(text)
 	if depth == "summary" && originalSize > 4096 {
-		if summary := a.trySummarizePage(url, text, prompt); summary != "" {
+		if summary := a.trySummarizePage(urlStr, text, prompt); summary != "" {
 			return map[string]any{
-				"url":            url,
+				"url":            urlStr,
 				"contentType":    contentType,
 				"text":           summary,
 				"size":           len(body),
@@ -371,7 +364,7 @@ func (a *App) WebFetch(url, prompt, depth string) (map[string]any, error) {
 	}
 
 	result := map[string]any{
-		"url":         url,
+		"url":         urlStr,
 		"contentType": contentType,
 		"text":        text,
 		"size":        len(body),
@@ -479,4 +472,26 @@ func excerptAround(text, prompt string, maxLen int) string {
 		out = out + "…"
 	}
 	return out
+}
+
+
+// detectBotPage checks if extracted text is actually an anti-bot challenge page.
+func detectBotPage(text, host string) string {
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "just a moment") || strings.Contains(lower, "checking your browser") {
+		return "Cloudflare/anti-DDoS challenge"
+	}
+	if strings.Contains(text, "百度安全验证") {
+		return "Baidu security verification"
+	}
+	if strings.Contains(text, "异常访问") || strings.Contains(text, "请输入验证码") {
+		return "Sogou anti-bot check"
+	}
+	if strings.Contains(lower, "captcha") || strings.Contains(lower, "g-recaptcha") || strings.Contains(text, "验证码") {
+		return "CAPTCHA required"
+	}
+	if len(text) < 80 && strings.Contains(text, "安全") && strings.Contains(text, "验证") {
+		return "Anti-bot security page"
+	}
+	return ""
 }

@@ -11,23 +11,26 @@ import (
 
 // LlamaModel runs a GGUF model via llama.cpp subprocess server.
 type LlamaModel struct {
-	id     string
-	name   string
-	path   string
-	srv    *llama.Server
-	info   ModelInfo
+	id      string
+	name    string
+	path    string
+	ctxSize int
+	srv     *llama.Server
+	info    ModelInfo
 }
 
 // NewLlamaRunner creates a LlamaModel. Load() starts the server.
-func NewLlamaRunner(id, name, modelPath string) (*LlamaModel, error) {
+// ctxSize specifies the context window in tokens (0 → server default 4096).
+func NewLlamaRunner(id, name, modelPath string, ctxSize int) (*LlamaModel, error) {
 	status := "unavailable"
 	if llama.Initialized() {
 		status = "available"
 	}
 	return &LlamaModel{
-		id:   id,
-		name: name,
-		path: modelPath,
+		id:      id,
+		name:    name,
+		path:    modelPath,
+		ctxSize: ctxSize,
 		info: ModelInfo{
 			ID:           id,
 			Name:         name,
@@ -48,7 +51,8 @@ func (m *LlamaModel) Load() error {
 	}
 
 	m.info.State = ModelStateLoading
-	srv, err := llama.StartServer(m.path)
+	cfg := llama.ServerConfig{CtxSize: m.ctxSize}
+	srv, err := llama.StartServer(m.path, cfg)
 	if err != nil {
 		m.info.State = ModelStateError
 		return fmt.Errorf("start llama server: %w", err)

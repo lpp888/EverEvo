@@ -15,6 +15,8 @@ import (
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"sync/atomic"
+
 	"everevo/internal/config"
 	"everevo/internal/httpclient"
 )
@@ -324,7 +326,7 @@ func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json
 
 	// Make the HTTP request
 	log.Printf("[chat] chatCompletion POST url=%s fmt=%s model=%s bodyLen=%d", url, p.APIFormat, p.Model, len(reqBody))
-	httpReq, err := http.NewRequest("POST", url, strings.NewReader(reqBody))
+	httpReq, err := http.NewRequestWithContext(a.chatCtx, "POST", url, strings.NewReader(reqBody))
 	if err != nil {
 		log.Printf("[chat] ChatProxy build request error: %v", err)
 		return nil, fmt.Errorf("构建请求失败: %w", err)
@@ -335,7 +337,12 @@ func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
 	}
 
-	client := httpclient.New(60 * time.Second)
+	// Use longer timeout for local endpoints (CPU inference on large prompts).
+		timeout := 60 * time.Second
+		if strings.Contains(p.Endpoint, "127.0.0.1") || strings.Contains(p.Endpoint, "localhost") {
+			timeout = 300 * time.Second
+		}
+		client := httpclient.New(timeout)
 	// Retry on transient network failures (proxy resets, connection drops)
 	var resp *http.Response
 	var doErr error
@@ -347,7 +354,7 @@ func (a *App) chatCompletion(p *config.LLMProvider, messagesJSON, toolsJSON json
 		if attempt < 2 && strings.Contains(doErr.Error(), "forcibly closed") {
 			log.Printf("[chat] retry %d/3 after: %v", attempt+1, doErr)
 			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-			httpReq, _ = http.NewRequest("POST", url, strings.NewReader(reqBody))
+			httpReq, _ = http.NewRequestWithContext(a.chatCtx, "POST", url, strings.NewReader(reqBody))
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set(authHeader, authValue)
 			if p.APIFormat == "anthropic" {
@@ -590,6 +597,10 @@ func (a *App) resolveProviderForStream(providerId, model string) (*config.LLMPro
 
 // runChatStream does the actual SSE streaming work (runs in a goroutine).
 func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, toolsJSON json.RawMessage, p *config.LLMProvider, opts chatOpts) (map[string]any, error) {
+	// Track active streams so background extraction jobs don't saturate the same model.
+	atomic.AddInt32(&a.activeStreams, 1)
+	defer atomic.AddInt32(&a.activeStreams, -1)
+
 	log.Printf("[chat] stream=%s provider=%s fmt=%s ep=%s model=%s", streamID, p.Name, p.APIFormat, p.Endpoint, p.Model)
 
 	base := strings.TrimRight(p.Endpoint, "/")
@@ -636,8 +647,8 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 		}
 		if opts.MaxTokens > 0 {
 			bodyMap["max_tokens"] = opts.MaxTokens
-		thinkApplyBody(bodyMap, p.APIFormat, opts.ThinkEffort)
 		}
+		thinkApplyBody(bodyMap, p.APIFormat, opts.ThinkEffort)
 		bodyBytes := mustMarshal(bodyMap)
 		reqBody = string(bodyBytes)
 	}
@@ -653,7 +664,15 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 		authValue = "Bearer " + p.APIKey
 	}
 
-	httpReq, err := http.NewRequest("POST", url, strings.NewReader(reqBody))
+	// SSE read loop — close body when the governing context is cancelled.
+	// Workflow nodes pass their engine ctx (so cancel stops the stream); chat
+	// passes the global chat ctx (shutdown only).
+	streamCtx := opts.Ctx
+	if streamCtx == nil {
+		streamCtx = a.chatCtx
+	}
+
+	httpReq, err := http.NewRequestWithContext(streamCtx, "POST", url, strings.NewReader(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("构建请求失败: %w", err)
 	}
@@ -676,7 +695,7 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 		if attempt < 2 && strings.Contains(doErr.Error(), "forcibly closed") {
 			log.Printf("[chat] stream interrupted, retry %d/3 after: %v", attempt+1, doErr)
 			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-			httpReq, _ = http.NewRequest("POST", url, strings.NewReader(reqBody))
+			httpReq, _ = http.NewRequestWithContext(streamCtx, "POST", url, strings.NewReader(reqBody))
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set(authHeader, authValue)
 			if p.APIFormat == "anthropic" {
@@ -703,13 +722,6 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, detail)
 	}
 
-	// SSE read loop — close body when the governing context is cancelled.
-	// Workflow nodes pass their engine ctx (so cancel stops the stream); chat
-	// passes the global chat ctx (shutdown only).
-	streamCtx := opts.Ctx
-	if streamCtx == nil {
-		streamCtx = a.chatCtx
-	}
 	go func() {
 		<-streamCtx.Done()
 		resp.Body.Close()
@@ -795,6 +807,7 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 		}
 	} else {
 		// OpenAI SSE format
+		logFirst := 3 // diagnostic: log keys for first N chunks
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
@@ -804,10 +817,16 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 				break
 			}
 			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "data: ") {
+			lineCount++
+			// Accept both "data: {...}" and "data:{...}" (llama.cpp may omit space)
+			var raw string
+			if strings.HasPrefix(line, "data: ") {
+				raw = line[6:]
+			} else if strings.HasPrefix(line, "data:") {
+				raw = line[5:]
+			} else {
 				continue
 			}
-			raw := strings.TrimPrefix(line, "data: ")
 			if raw == "[DONE]" {
 				continue
 			}
@@ -821,8 +840,18 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 			}
 			ch, _ := choices[0].(map[string]any)
 			delta, _ := ch["delta"].(map[string]any)
+			// Fallback: some servers return message instead of delta in stream
+			if delta == nil {
+				delta, _ = ch["message"].(map[string]any)
+			}
 			if delta == nil {
 				continue
+			}
+			if logFirst > 0 {
+				logFirst--
+				keys := make([]string, 0, len(delta))
+				for k := range delta { keys = append(keys, k) }
+				log.Printf("[chat] stream=%s SSE chunk keys=%v", streamID, keys)
 			}
 			// Text delta
 			if text, ok := delta["content"].(string); ok && text != "" {
@@ -844,7 +873,6 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 					if tcm == nil {
 						continue
 					}
-					// index is optional in some providers' chunks — default 0.
 					idx := 0
 					if iv, ok := tcm["index"].(float64); ok {
 						idx = int(iv)
@@ -861,8 +889,9 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 					if fn, ok := tcm["function"].(map[string]any); ok {
 						if name, ok := fn["name"].(string); ok && name != "" {
 							fnMap, _ := toolCalls[idx]["function"].(map[string]any)
-							if cur, _ := fnMap["name"].(string); true {
-								fnMap["name"] = cur + name
+							// Set on first chunk only (avoid duplicating name on re-sends)
+							if cur, _ := fnMap["name"].(string); cur == "" {
+								fnMap["name"] = name
 							}
 						}
 						if args, ok := fn["arguments"].(string); ok && args != "" {
@@ -886,7 +915,7 @@ func (a *App) runChatStream(streamID string, messagesJSON json.RawMessage, tools
 	if contentLen == 0 && len(toolCalls) == 0 {
 		log.Printf("[chat] stream=%s WARNING: empty response (0 content, 0 tool_calls, %d lines) — likely context overflow on the model", streamID, lineCount)
 	} else {
-		log.Printf("[chat] stream=%s SSE done: %d chars, %d tool_calls", streamID, contentLen, len(toolCalls))
+		log.Printf("[chat] stream=%s SSE done: %d chars, %d tool_calls, %d lines", streamID, contentLen, len(toolCalls), lineCount)
 	}
 	return map[string]any{"choices": []any{map[string]any{"message": result}}}, nil
 }

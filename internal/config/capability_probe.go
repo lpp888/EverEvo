@@ -418,6 +418,9 @@ func knownContextDefault(model string) int {
 		if strings.Contains(lower, "max") || strings.Contains(lower, "plus") {
 			return 1_000_000
 		}
+		if strings.Contains(lower, "qwen3") || strings.Contains(lower, "qwq") {
+			return 65_536 // Qwen3 / Qwen3.5 / QwQ
+		}
 		return 128_000
 	}
 

@@ -100,7 +100,7 @@ func Presets() []Preset {
 		{Name: "智谱 GLM", Type: "glm", APIFormat: "openai", Endpoint: "https://open.bigmodel.cn/api/paas/v4", Icon: "□"},
 		{Name: "Moonshot", Type: "moonshot", APIFormat: "openai", Endpoint: "https://api.moonshot.cn/v1", Icon: "◉"},
 		{Name: "Ollama 本地", Type: "ollama", APIFormat: "openai-compat", Endpoint: "http://127.0.0.1:11434/v1", Icon: "●"},
-		{Name: "llama.cpp 本地", Type: "llamacpp", APIFormat: "openai-compat", Endpoint: "http://127.0.0.1:8080/v1", Icon: "◆"},
+		{Name: "llama.cpp 本地", Type: "llamacpp", APIFormat: "openai-compat", Endpoint: "http://127.0.0.1:8082/v1", Icon: "◆"},
 	}
 }
 

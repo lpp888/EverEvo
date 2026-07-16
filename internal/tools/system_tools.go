@@ -112,10 +112,10 @@ func registerSystemTools() {
 		},
 	})
 
-	// web_search — search the web via DuckDuckGo (free, no API key).
+	// web_search — multi-engine composite search (Bing + DuckDuckGo, free, no API key).
 	Register(&ToolDef{
 		Name:        "web_search",
-		Description: "搜索互联网，返回标题、摘要和链接。基于 DuckDuckGo，免费无需 API Key。每次搜索返回前 8 条结果。",
+		Description: "搜索互联网，返回标题、摘要和链接。多引擎复合搜索（百度 + Bing + 搜狗 + DuckDuckGo），4 引擎并行查询、合并去重，免费无需 API Key。国内网络百度/搜狗优先，国外 Bing 兜底。每次最多 15 条结果。",
 		Category:    "system",
 		Annotations: &ToolAnnotations{ReadOnlyHint: true},
 		Parameters: &ToolParams{

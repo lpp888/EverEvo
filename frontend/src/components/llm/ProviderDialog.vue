@@ -596,8 +596,8 @@ async function detectLocalModels() {
   const token = ++_detectCancelId
   const isOllama = provForm.type === 'ollama'
   const isLlamaCpp = provForm.type === 'llamacpp'
-  const defaultPort = isOllama ? 11434 : (isLlamaCpp ? 8080 : 0)
-  const altPorts = isOllama ? [11434, 11435, 8080] : (isLlamaCpp ? [8080, 8081, 11434] : [])
+  const defaultPort = isOllama ? 11434 : (isLlamaCpp ? 8082 : 0)
+  const altPorts = isOllama ? [11434, 11435, 8082] : (isLlamaCpp ? [8082, 8080, 8081, 11434] : [])
 
   let models: any[] | null = null; let usedPort: number | null = null
   const portsToTry = ([extractPort(provForm.endpoint) || defaultPort, ...altPorts] as number[])
@@ -637,7 +637,7 @@ async function detectLocalModels() {
   } else {
     const hint = isOllama
       ? 'Ollama 默认端口 11434，请确认 ollama serve 已启动。已尝试端口: ' + portsToTry.join(', ')
-      : 'llama.cpp 默认端口 8080，请确认 llama-server 已启动。已尝试端口: ' + portsToTry.join(', ')
+      : 'llama.cpp 默认端口 8082，请确认 llama-server 已启动。已尝试端口: ' + portsToTry.join(', ')
     t('warning', '未检测到模型', hint)
   }
   detectingLocal.value = false

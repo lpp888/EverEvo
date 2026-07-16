@@ -73,6 +73,14 @@ func Close() {}
 
 // ─── Server ─────────────────────────────────────────────────────
 
+// ServerConfig holds optional tuning parameters for StartServer.
+// Zero values mean "use defaults".
+type ServerConfig struct {
+	CtxSize   int // context size in tokens (0 → 4096)
+	BatchSize int // batch processing size (0 → 512)
+	GPULayers int // layers to offload to GPU (0 → 9999 = all)
+}
+
 // Server manages a running llama-server subprocess for one model.
 type Server struct {
 	cmd       *exec.Cmd
@@ -93,8 +101,8 @@ func findFreePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// StartServer launches llama-server for the given model.
-func StartServer(modelPath string) (*Server, error) {
+// StartServer launches llama-server for the given model with optional config.
+func StartServer(modelPath string, cfg ServerConfig) (*Server, error) {
 	mu.Lock()
 	bin := binPath
 	mu.Unlock()
@@ -106,19 +114,29 @@ func StartServer(modelPath string) (*Server, error) {
 		return nil, fmt.Errorf("model file not found: %s", modelPath)
 	}
 
+	// Apply defaults for zero-valued config fields
+	if cfg.CtxSize <= 0 {
+		cfg.CtxSize = 4096
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = 512
+	}
+	if cfg.GPULayers <= 0 {
+		cfg.GPULayers = 9999 // offload all layers to GPU (ignored if CPU-only build)
+	}
+
 	port, err := findFreePort()
 	if err != nil {
 		return nil, fmt.Errorf("find port: %w", err)
 	}
 
-	// Detect GPU layers: use -ngl 9999 to offload all layers if CUDA/ROCm build
 	args := []string{
 		"-m", modelPath,
 		"--port", fmt.Sprintf("%d", port),
 		"--host", "127.0.0.1",
-		"-ngl", "9999", // offload all layers to GPU (ignored if CPU-only build)
-		"--ctx-size", "4096",
-		"--batch-size", "512",
+		"-ngl", fmt.Sprintf("%d", cfg.GPULayers),
+		"--ctx-size", fmt.Sprintf("%d", cfg.CtxSize),
+		"--batch-size", fmt.Sprintf("%d", cfg.BatchSize),
 		"--no-webui",
 	}
 
@@ -145,7 +163,7 @@ func StartServer(modelPath string) (*Server, error) {
 		return nil, fmt.Errorf("llama-server not ready: %w", err)
 	}
 
-	log.Printf("[llama] server ready on port %d for %s", port, filepath.Base(modelPath))
+	log.Printf("[llama] server ready on port %d ctx=%d for %s", port, cfg.CtxSize, filepath.Base(modelPath))
 	return srv, nil
 }
 

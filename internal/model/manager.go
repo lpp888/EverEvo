@@ -62,7 +62,7 @@ func (mgr *Manager) LoadModelFile(id, name, modelPath string) (ModelInfo, error)
 		}
 		m = onnxM
 	case ".gguf":
-		llamaM, err := NewLlamaRunner(id, name, modelPath)
+		llamaM, err := NewLlamaRunner(id, name, modelPath, 0)
 		if err != nil {
 			return ModelInfo{}, fmt.Errorf("创建 llama.cpp 运行器失败: %w", err)
 		}

@@ -74,6 +74,7 @@ type App struct {
 	memSweepDone    chan struct{}
 	wikiStores      map[string]*wiki.Store           // per-library wiki stores, keyed by libraryID
 	wikiStoreMu     sync.RWMutex
+	activeStreams   int32                                // atomic counter; >0 → skip extraction
 	streamCancelMu  sync.Mutex
 	streamCancels   map[string]context.CancelFunc    // streamID → cancel
 	zone            *zone.Zone                        // current runtime zone
@@ -815,9 +816,12 @@ func (a *App) Shutdown(ctx context.Context) {
 			_ = zone.WriteManifest(a.zone.Dir, m)
 		}
 	}
-	if a.chatCancel != nil {
-		a.chatCancel()
-	}
+	// Kill internally-managed llama-server subprocesses (model_load path).
+		// External llama-server / Ollama are managed by the user.
+		a.manager.Shutdown()
+		if a.chatCancel != nil {
+			a.chatCancel()
+		}
 	if a.mcpServer != nil {
 		if err := a.mcpServer.Stop(); err != nil {
 			log.Printf("⚠ EverEvo MCP 服务停止失败: %v", err)

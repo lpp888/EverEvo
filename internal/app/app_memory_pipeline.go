@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -937,6 +938,15 @@ func (a *App) scheduler() {
 	// ── Facts + Graph (every N user messages) ──
 	if shouldFire("schedFacts", scheduleFacts) {
 		markFired("schedFacts")
+		// Skip extraction while a chat stream is active on a local endpoint —
+		// local models can't serve two requests simultaneously and will timeout.
+		if atomic.LoadInt32(&a.activeStreams) > 0 {
+			p, _ := a.resolveExtractionProvider()
+			if p != nil && (strings.Contains(p.Endpoint, "127.0.0.1") || strings.Contains(p.Endpoint, "localhost")) {
+				log.Printf("[sched] skip facts+graph: chat stream active on local model")
+				return
+			}
+		}
 		dialogue := collectDialogue(60)
 		if dialogue == "" { return }
 		p, err := a.resolveExtractionProvider()

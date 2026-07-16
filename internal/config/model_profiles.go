@@ -61,10 +61,19 @@ var modelPresets = []struct {
 	{"qwen2.5-32b", ModelProfile{"Qwen2.5 32B", 32_768, 0, 90, 85, false}},
 	{"qwen2.5-14b", ModelProfile{"Qwen2.5 14B", 32_768, 0, 90, 85, false}},
 	{"qwen2.5-7b", ModelProfile{"Qwen2.5 7B", 32_768, 0, 90, 85, false}},
+	// Qwen3.5 — before Qwen3 so "qwen3.5" key doesn't match "qwen3" first
+	{"qwen3.5-32b", ModelProfile{"Qwen3.5 32B", 65_536, 0, 95, 90, false}},
+	{"qwen3.5-14b", ModelProfile{"Qwen3.5 14B", 65_536, 0, 95, 90, false}},
+	{"qwen3.5-9b", ModelProfile{"Qwen3.5 9B", 65_536, 0, 95, 90, false}},
+	{"qwen3.5-8b", ModelProfile{"Qwen3.5 8B", 65_536, 0, 95, 90, false}},
+	{"qwen3.5-0.6b", ModelProfile{"Qwen3.5 0.6B", 65_536, 0, 95, 90, false}},
+	{"qwen3.5", ModelProfile{"Qwen3.5", 65_536, 0, 95, 90, false}},
+	// Qwen3
 	{"qwen3-235b", ModelProfile{"Qwen3 235B", 131_072, 0, 95, 90, false}},
 	{"qwen3-32b", ModelProfile{"Qwen3 32B", 131_072, 0, 95, 90, false}},
 	{"qwen3-8b", ModelProfile{"Qwen3 8B", 131_072, 0, 95, 90, false}},
 	{"qwen3", ModelProfile{"Qwen3", 131_072, 0, 95, 90, false}},
+	// Qwen cloud / Tongyi
 	{"qwen-max", ModelProfile{"Qwen Max", 1_000_000, 0, 95, 90, false}},
 	{"qwen-plus", ModelProfile{"Qwen Plus", 1_000_000, 0, 95, 90, false}},
 	{"qwen-turbo", ModelProfile{"Qwen Turbo", 1_000_000, 0, 95, 90, false}},
